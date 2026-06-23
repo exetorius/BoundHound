@@ -1,0 +1,29 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "BoundHound",
+	"Description": "Frame-rate triage for Unreal Engine. Answers 'am I CPU- or GPU-bound?' first, then drives Unreal Insights trace capture and trace+log analysis — all callable from Python or the engine's AI toolset. UE 5.8 ships no native perf/tracing tools; BoundHound fills that gap.",
+	"Category": "Profiling",
+	"CreatedBy": "exetorius",
+	"CreatedByURL": "https://github.com/exetorius/BoundHound",
+	"DocsURL": "https://github.com/exetorius/BoundHound#readme",
+	"MarketplaceURL": "",
+	"SupportURL": "https://github.com/exetorius/BoundHound/issues",
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "BoundHound",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "ToolsetRegistry",
+			"Enabled": true
+		}
+	]
+}
