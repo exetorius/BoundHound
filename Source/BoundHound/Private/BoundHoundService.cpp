@@ -1,4 +1,4 @@
-﻿// Copyright (c) 2026 exetorius. Released under the MIT License.
+// Copyright (c) 2026 exetorius. Released under the MIT License.
 
 #include "BoundHoundService.h"
 #include "Json.h"
@@ -23,7 +23,7 @@
 DEFINE_LOG_CATEGORY_STATIC(LogBoundHound, Log, All);
 
 // ---------------------------------------------------------------------------
-// Session state â€” persists across MCP requests within an editor session
+// Session state -- persists across MCP requests within an editor session
 // ---------------------------------------------------------------------------
 
 static FString GLastTraceFilePath;
@@ -201,7 +201,7 @@ static FString AnalyseTrace(const FString& TraceFile)
 
 				if (AllMs.IsEmpty())
 				{
-					Root->SetStringField(TEXT("warning"), TEXT("All frames were filtered (invalid timestamps) â€” no frame stats available."));
+					Root->SetStringField(TEXT("warning"), TEXT("All frames were filtered (invalid timestamps) -- no frame stats available."));
 				}
 				else
 				{
@@ -394,10 +394,10 @@ FString UBoundHoundService::FrameTiming()
 	R->SetStringField(TEXT("note"),
 		bPIE
 		? TEXT("Values are for the most recently rendered PIE frame. Park in a representative/worst spot for a clean read.")
-		: TEXT("PIE is NOT running â€” these values reflect the EDITOR viewport, not your game. Start PIE (Epic's EditorAppToolset.StartPIE) for a real game-bound reading."));
+		: TEXT("PIE is NOT running -- these values reflect the EDITOR viewport, not your game. Start PIE (Epic's EditorAppToolset.StartPIE) for a real game-bound reading."));
 	if (GpuMs <= 0.0)
 	{
-		R->SetStringField(TEXT("gpu_note"), TEXT("gpu_ms is 0 (GPU timing unavailable this frame) â€” rely on the game vs render comparison, and confirm GPU-bound with the r.ScreenPercentage 50 test."));
+		R->SetStringField(TEXT("gpu_note"), TEXT("gpu_ms is 0 (GPU timing unavailable this frame) -- rely on the game vs render comparison, and confirm GPU-bound with the r.ScreenPercentage 50 test."));
 	}
 	return OkJson(R);
 }

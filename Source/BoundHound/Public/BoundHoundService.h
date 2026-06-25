@@ -1,4 +1,4 @@
-﻿// Copyright (c) 2026 exetorius. Released under the MIT License.
+// Copyright (c) 2026 exetorius. Released under the MIT License.
 
 #pragma once
 
@@ -7,7 +7,7 @@
 #include "BoundHoundService.generated.h"
 
 /**
- * Performance & tracing service â€” frame-timing triage, Unreal Insights trace capture, trace+log
+ * Performance & tracing service -- frame-timing triage, Unreal Insights trace capture, trace+log
  * analysis, and trace-attached standalone play.
  *
  * Standalone extraction of VibeUE's UPerformanceService. Unreal 5.8's native toolsets have NO
@@ -28,7 +28,7 @@ public:
 	/**
 	 * Report Game/Render/GPU/RHI thread ms + a CPU-vs-GPU bound verdict and hint for the most recently
 	 * rendered frame (the same data as the on-screen "stat unit"). RUN THIS FIRST in any frame-rate
-	 * investigation â€” optimising the GPU does nothing if the frame is game- or render-thread bound.
+	 * investigation -- optimising the GPU does nothing if the frame is game- or render-thread bound.
 	 */
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "BoundHound|Performance")
 	static FString FrameTiming();

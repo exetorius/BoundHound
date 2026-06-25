@@ -1,4 +1,4 @@
-﻿// Copyright (c) 2026 exetorius. Released under the MIT License.
+// Copyright (c) 2026 exetorius. Released under the MIT License.
 
 #include "Modules/ModuleManager.h"
 #include "CoreGlobals.h"
@@ -12,7 +12,7 @@
 DEFINE_LOG_CATEGORY_STATIC(LogBoundHound, Log, All);
 
 // Collect every non-abstract UToolsetDefinition subclass defined in THIS module (/Script/BoundHound)
-// that exposes at least one AICallable tool. Reflection-based â€” mirrors VibeUE's registration so
+// that exposes at least one AICallable tool. Reflection-based -- mirrors VibeUE's registration so
 // the toolset registers without manually naming the class.
 static void GatherBoundHoundToolsetClasses(TArray<UClass*>& OutClasses)
 {
