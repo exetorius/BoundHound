@@ -27,12 +27,29 @@ print(json.loads(unreal.BoundHoundService.frame_timing()))
   "frame_ms": 25.1,
   "fps": 39.8,
   "bound": "GameThread",
+  "bound_confidence": "clear",   // clear | moderate | marginal | none
+  "margin_ms": 13.9,             // how far the bottleneck leads the runner-up
+  "contested": false,            // true when the top two threads are within ~10%
   "hint": "CPU game-thread bound. Usual cause: Tick / Blueprint / AI / animation cost. Run 'stat dumpframe -ms=0.5 -root=gamethread' ... dropping r.ScreenPercentage will NOT help a game-thread-bound frame.",
+  "budget": {
+    "target_fps": 60,
+    "budget_ms": 16.67,
+    "frame_headroom_ms": -8.44,  // negative = over budget
+    "meets_target": false,
+    "verdict": "FAIL",
+    "threads": {
+      "game_thread":   { "ms": 25.1, "headroom_ms": -8.44, "over_budget": true },
+      "render_thread": { "ms": 8.4,  "headroom_ms": 8.27,  "over_budget": false },
+      "gpu":           { "ms": 11.2, "headroom_ms": 5.47,  "over_budget": false }
+    }
+  },
   "pie_running": true
 }
 ```
 
-One call, and you know: **25.1 ms on the game thread caps you at ~40 FPS no matter what you do to the GPU.** That's the whole pitch.
+One call, and you know: **25.1 ms on the game thread caps you at ~40 FPS no matter what you do to the GPU** — and it `FAIL`s a 60 FPS budget on the game thread alone. That's the whole pitch.
+
+Pass a target to gate against a different frame rate: `frame_timing(120)`. When the top two threads are within ~10% the verdict reports `contested: true` and names the runner-up in `contested_with`, so you don't chase a false winner that frame-to-frame noise can flip. When `gpu_ms` is `0` (GPU timing unavailable) a CPU verdict is downgraded to `moderate` confidence — a hidden GPU cost could still be the real bottleneck.
 
 ## API
 
@@ -87,7 +104,6 @@ MIT — see [LICENSE](LICENSE). Do whatever you like with it.
 
 ## Roadmap ideas
 
-- Per-thread **ms budgets + pass/fail gating** (turn "inspect" into "guard" for CI).
 - **Baseline + diff** ("game thread +3.2 ms since last capture").
 - **Auto drill-down**: when `bound == GameThread`, fire `stat dumpframe` and parse the worst scopes automatically.
 

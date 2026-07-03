@@ -350,7 +350,22 @@ static FString AnalyseBoth(const FString& TraceFile, const FString& LogFile)
 // AICallable methods
 // ===========================================================================
 
-FString UBoundHoundService::FrameTiming()
+// Per-thread advice keyed by the winning bottleneck. Kept next to FrameTiming so the verdict and its
+// remediation hint stay in lockstep.
+static FString BoundHint(const FString& Bound)
+{
+	if (Bound == TEXT("GPU"))
+	{
+		return TEXT("GPU-bound. NOW it is worth profiling the GPU: StartTrace (channels frame,gpu,cpu), then 'r.ProfileGPU.ShowUI 0' + 'ProfileGPU' and read the pass breakdown from the log. Levers: shadows (Virtual Shadow Maps), Lumen GI/reflections, translucency, post-process, ScreenPercentage. Confirm with the resolution test: 'r.ScreenPercentage 50' should noticeably raise FPS if truly GPU-bound.");
+	}
+	if (Bound == TEXT("RenderThread"))
+	{
+		return TEXT("CPU render-thread bound. Usual cause: too many draw calls / primitives, or many dynamic shadow-casting lights. Check 'stat scenerendering'. Levers: merge/instance meshes, enable Nanite, cut dynamic lights and per-light shadows. NOTE: dropping r.ScreenPercentage will NOT help a render-thread-bound frame.");
+	}
+	return TEXT("CPU game-thread bound. Usual cause: Tick / Blueprint / AI / animation cost. Run 'stat dumpframe -ms=0.5 -root=gamethread' on the PIE world then read the result. Levers: throttle/disable unnecessary Tick, reduce ticking actors & AI, cut expensive Blueprint tick logic. NOTE: dropping r.ScreenPercentage will NOT help a game-thread-bound frame.");
+}
+
+FString UBoundHoundService::FrameTiming(float TargetFPS)
 {
 	const double GameMs   = FPlatformTime::ToMilliseconds(GGameThreadTime);
 	const double RenderMs = FPlatformTime::ToMilliseconds(GRenderThreadTime);
@@ -365,29 +380,103 @@ FString UBoundHoundService::FrameTiming()
 	R->SetNumberField(TEXT("rhi_thread_ms"),    Round2(RHIMs));
 	R->SetNumberField(TEXT("gpu_ms"),           Round2(GpuMs));
 
+	const bool bGpuAvailable = GpuMs > 0.0;
 	const double FrameMs = FMath::Max3(GameMs, RenderMs, GpuMs);
 	R->SetNumberField(TEXT("frame_ms"), Round2(FrameMs));
 	R->SetNumberField(TEXT("fps"), FrameMs > 0.0 ? Round2(1000.0 / FrameMs) : 0.0);
 
-	FString Bound;
-	FString Hint;
-	if (GpuMs >= GameMs && GpuMs >= RenderMs && GpuMs > 0.0)
-	{
-		Bound = TEXT("GPU");
-		Hint  = TEXT("GPU-bound. NOW it is worth profiling the GPU: StartTrace (channels frame,gpu,cpu), then 'r.ProfileGPU.ShowUI 0' + 'ProfileGPU' and read the pass breakdown from the log. Levers: shadows (Virtual Shadow Maps), Lumen GI/reflections, translucency, post-process, ScreenPercentage. Confirm with the resolution test: 'r.ScreenPercentage 50' should noticeably raise FPS if truly GPU-bound.");
-	}
-	else if (RenderMs >= GameMs)
-	{
-		Bound = TEXT("RenderThread");
-		Hint  = TEXT("CPU render-thread bound. Usual cause: too many draw calls / primitives, or many dynamic shadow-casting lights. Check 'stat scenerendering'. Levers: merge/instance meshes, enable Nanite, cut dynamic lights and per-light shadows. NOTE: dropping r.ScreenPercentage will NOT help a render-thread-bound frame.");
-	}
-	else
-	{
-		Bound = TEXT("GameThread");
-		Hint  = TEXT("CPU game-thread bound. Usual cause: Tick / Blueprint / AI / animation cost. Run 'stat dumpframe -ms=0.5 -root=gamethread' on the PIE world then read the result. Levers: throttle/disable unnecessary Tick, reduce ticking actors & AI, cut expensive Blueprint tick logic. NOTE: dropping r.ScreenPercentage will NOT help a game-thread-bound frame.");
-	}
+	// --- Robust verdict -------------------------------------------------------
+	// Rank the candidate threads (GPU only counts when its timing is available), then judge how
+	// decisive the winner is. Two threads within CONTESTED_PCT of each other are a genuine tie: the
+	// noise between frames can flip them, so we report "contested" rather than an over-confident pick.
+	struct FThread { const TCHAR* Name; double Ms; };
+	TArray<FThread, TInlineAllocator<3>> Threads;
+	Threads.Add({ TEXT("GameThread"),   GameMs });
+	Threads.Add({ TEXT("RenderThread"), RenderMs });
+	if (bGpuAvailable) Threads.Add({ TEXT("GPU"), GpuMs });
+	Threads.Sort([](const FThread& A, const FThread& B) { return A.Ms > B.Ms; });
+
+	const FString Bound = Threads[0].Name;
+	const double TopMs    = Threads[0].Ms;
+	const double RunnerMs = Threads.Num() > 1 ? Threads[1].Ms : 0.0;
+	const FString RunnerName = Threads.Num() > 1 ? FString(Threads[1].Name) : FString();
+	const double MarginMs = TopMs - RunnerMs;
+
+	// Margin as a fraction of the bottleneck cost -- a 0.3 ms gap means a lot at 3 ms and nothing at 30.
+	constexpr double CONTESTED_PCT = 0.10; // top must lead the runner-up by >10% to be a clear win
+	const bool bContested = TopMs > 0.0 && (MarginMs / TopMs) < CONTESTED_PCT;
+
+	FString Confidence;
+	if (TopMs <= 0.0)                       Confidence = TEXT("none");     // no meaningful timing yet
+	else if (bContested)                    Confidence = TEXT("marginal");
+	else if (!bGpuAvailable)                Confidence = TEXT("moderate"); // CPU winner, but GPU unknown
+	else                                    Confidence = TEXT("clear");
+
 	R->SetStringField(TEXT("bound"), Bound);
+	R->SetStringField(TEXT("bound_confidence"), Confidence);
+	R->SetNumberField(TEXT("margin_ms"), Round2(MarginMs));
+	R->SetBoolField(TEXT("contested"), bContested);
+
+	FString Hint = BoundHint(Bound);
+	if (bContested && !RunnerName.IsEmpty())
+	{
+		R->SetStringField(TEXT("contested_with"), RunnerName);
+		Hint = FString::Printf(
+			TEXT("CONTESTED: %s (%.2f ms) and %s (%.2f ms) are within %.2f ms -- frame-to-frame noise can flip which one 'wins', so treat both as bottlenecks. Take several readings, or trace both. %s"),
+			*Bound, TopMs, *RunnerName, RunnerMs, MarginMs, *BoundHint(Bound));
+	}
+	else if (!bGpuAvailable && Bound != TEXT("GPU"))
+	{
+		Hint = FString::Printf(
+			TEXT("%s NOTE: GPU timing is unavailable this frame, so this CPU verdict is unconfirmed -- a hidden GPU cost could still be the real bottleneck. Confirm with the 'r.ScreenPercentage 50' test."),
+			*Hint);
+	}
 	R->SetStringField(TEXT("hint"), Hint);
+
+	// --- Frame-time budget gate ----------------------------------------------
+	// FPS is 1000/frame_ms, and the threads run in parallel, so EACH thread must individually finish
+	// inside the per-frame budget. Report every thread's headroom against the target and gate on the
+	// bottleneck -- this is what turns a one-shot reading into a pass/fail guard.
+	const double SafeTargetFps = (FMath::IsFinite(TargetFPS) && TargetFPS > 0.0f) ? (double)TargetFPS : 60.0;
+	const double BudgetMs = 1000.0 / SafeTargetFps;
+
+	TSharedPtr<FJsonObject> Budget = MakeShared<FJsonObject>();
+	Budget->SetNumberField(TEXT("target_fps"), Round2(SafeTargetFps));
+	Budget->SetNumberField(TEXT("budget_ms"), Round2(BudgetMs));
+
+	auto ThreadBudget = [&](double Ms, bool bAvailable) -> TSharedPtr<FJsonValue>
+	{
+		TSharedPtr<FJsonObject> T = MakeShared<FJsonObject>();
+		T->SetNumberField(TEXT("ms"), Round2(Ms));
+		if (bAvailable)
+		{
+			T->SetNumberField(TEXT("headroom_ms"), Round2(BudgetMs - Ms));
+			T->SetBoolField(TEXT("over_budget"), Ms > BudgetMs);
+		}
+		else
+		{
+			T->SetBoolField(TEXT("available"), false);
+		}
+		return MakeShared<FJsonValueObject>(T);
+	};
+
+	TSharedPtr<FJsonObject> PerThread = MakeShared<FJsonObject>();
+	PerThread->SetField(TEXT("game_thread"),   ThreadBudget(GameMs, true));
+	PerThread->SetField(TEXT("render_thread"), ThreadBudget(RenderMs, true));
+	PerThread->SetField(TEXT("gpu"),           ThreadBudget(GpuMs, bGpuAvailable));
+	Budget->SetObjectField(TEXT("threads"), PerThread);
+
+	Budget->SetNumberField(TEXT("frame_headroom_ms"), Round2(BudgetMs - FrameMs));
+	const bool bMeetsTarget = FrameMs > 0.0 && FrameMs <= BudgetMs;
+	Budget->SetBoolField(TEXT("meets_target"), bMeetsTarget);
+	Budget->SetStringField(TEXT("verdict"), bMeetsTarget ? TEXT("PASS") : TEXT("FAIL"));
+	if (!bMeetsTarget && FrameMs > 0.0)
+	{
+		Budget->SetStringField(TEXT("budget_note"), FString::Printf(
+			TEXT("%s is %.2f ms over the %.2f ms budget for %g FPS -- that thread alone caps you at ~%.0f FPS. Fix the bottleneck thread, not whichever is cheapest."),
+			*Bound, TopMs - BudgetMs, BudgetMs, SafeTargetFps, FrameMs > 0.0 ? 1000.0 / FrameMs : 0.0));
+	}
+	R->SetObjectField(TEXT("budget"), Budget);
 
 	const bool bPIE = IsPIERunning();
 	R->SetBoolField(TEXT("pie_running"), bPIE);
