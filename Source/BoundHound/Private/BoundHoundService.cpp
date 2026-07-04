@@ -8,6 +8,10 @@
 #include "HAL/FileManager.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/PlatformTime.h"
+#include "HAL/IConsoleManager.h"
+#include "Containers/Ticker.h"
+#include "RenderingThread.h"   // ENQUEUE_RENDER_COMMAND
+#include "RHICommandList.h"    // FRHICommandListImmediate
 #include "Modules/ModuleManager.h"
 #include "ProfilingDebugging/TraceAuxiliary.h"
 #include "ProfilingDebugging/MiscTrace.h"
@@ -488,6 +492,107 @@ FString UBoundHoundService::FrameTiming(float TargetFPS)
 	{
 		R->SetStringField(TEXT("gpu_note"), TEXT("gpu_ms is 0 (GPU timing unavailable this frame) -- rely on the game vs render comparison, and confirm GPU-bound with the r.ScreenPercentage 50 test."));
 	}
+	return OkJson(R);
+}
+
+FString UBoundHoundService::ForceHitch(const FString& Thread, float Milliseconds, int32 Frames)
+{
+	const FString Mode = Thread.IsEmpty() ? TEXT("game") : Thread.ToLower();
+	const bool bGame   = (Mode == TEXT("game")   || Mode == TEXT("both"));
+	const bool bRender = (Mode == TEXT("render") || Mode == TEXT("both"));
+	const bool bGpu    = (Mode == TEXT("gpu"));
+
+	if (!bGame && !bRender && !bGpu)
+	{
+		return ErrJson(TEXT("BAD_THREAD"), FString::Printf(
+			TEXT("Unknown Thread '%s'. Use 'game', 'render', 'both', or 'gpu'."), *Thread));
+	}
+
+	// Clamp so a fat-fingered value can't freeze the editor for a minute or spin forever.
+	const float StallMs      = FMath::Clamp(Milliseconds, 1.0f, 5000.0f);
+	const int32 HitchFrames  = FMath::Clamp(Frames, 1, 600);
+	const float StallSeconds = StallMs / 1000.0f;
+
+	// GPU forcing: supersample by driving r.ScreenPercentage up, restored when the countdown ends. This is
+	// the only scene-agnostic GPU lever we have -- the actual cost still depends on what's on screen, so a
+	// trivial PIE scene may not tip the frame GPU-bound. That's why gpu is documented as best-effort.
+	constexpr float GpuScreenPercentage = 400.0f;
+	float SavedScreenPercentage = 100.0f;
+	IConsoleVariable* ScreenPctCVar = bGpu
+		? IConsoleManager::Get().FindConsoleVariable(TEXT("r.ScreenPercentage"))
+		: nullptr;
+	if (bGpu && ScreenPctCVar)
+	{
+		SavedScreenPercentage = ScreenPctCVar->GetFloat();
+		ScreenPctCVar->Set(GpuScreenPercentage, ECVF_SetByConsole);
+	}
+
+	// One ticker fires once per game-thread frame. It re-applies the stall for HitchFrames frames, then
+	// tears itself down (restoring any GPU cvar it changed). Sleeping inside the ticker runs within the
+	// engine's measured game-thread frame, so GGameThreadTime picks it up -- which is the whole point.
+	TSharedRef<int32> Remaining = MakeShared<int32>(HitchFrames);
+	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+		[bGame, bRender, bGpu, StallSeconds, Remaining, ScreenPctCVar, SavedScreenPercentage](float) -> bool
+		{
+			if (bGame)
+			{
+				FPlatformProcess::Sleep(StallSeconds);
+			}
+			if (bRender)
+			{
+				const float RtSeconds = StallSeconds;
+				ENQUEUE_RENDER_COMMAND(BoundHoundForceHitch)(
+					[RtSeconds](FRHICommandListImmediate&)
+					{
+						FPlatformProcess::Sleep(RtSeconds);
+					});
+			}
+
+			if (--(*Remaining) > 0)
+			{
+				return true; // keep hitching next frame
+			}
+
+			// Countdown finished -- undo the GPU cost bump and unregister the ticker.
+			if (bGpu && ScreenPctCVar)
+			{
+				ScreenPctCVar->Set(SavedScreenPercentage, ECVF_SetByConsole);
+			}
+			return false;
+		}));
+
+	// Tell the caller exactly what to expect from FrameTiming, so validation is a direct compare.
+	const TCHAR* Expect =
+		  (Mode == TEXT("both"))   ? TEXT("contested=true (GameThread and RenderThread within margin)")
+		: (Mode == TEXT("render"))? TEXT("bound=RenderThread")
+		: (Mode == TEXT("gpu"))   ? TEXT("bound=GPU IF the scene's GPU cost now exceeds the CPU threads (scene-dependent)")
+		:                           TEXT("bound=GameThread");
+
+	TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("forcing"), Mode);
+	R->SetNumberField(TEXT("frames"), HitchFrames);
+	R->SetStringField(TEXT("expect"), Expect);
+	if (bGame || bRender)
+	{
+		R->SetNumberField(TEXT("stall_ms_per_frame"), StallMs);
+	}
+	if (bGpu)
+	{
+		if (ScreenPctCVar)
+		{
+			R->SetNumberField(TEXT("screen_percentage"), GpuScreenPercentage);
+			R->SetNumberField(TEXT("restore_screen_percentage"), SavedScreenPercentage);
+		}
+		else
+		{
+			R->SetStringField(TEXT("gpu_warning"), TEXT("r.ScreenPercentage cvar not found -- GPU load NOT applied."));
+		}
+	}
+	if (!IsPIERunning())
+	{
+		R->SetStringField(TEXT("note"), TEXT("PIE is not running -- the hitch lands on the editor viewport frame. Start PIE for a game-representative validation."));
+	}
+	R->SetStringField(TEXT("hint"), TEXT("Now call FrameTiming (on a following frame) and confirm the reading matches 'expect'. Thread times reflect the last COMPLETED frame, so read at least one frame after this call."));
 	return OkJson(R);
 }
 

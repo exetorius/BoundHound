@@ -42,6 +42,26 @@ public:
 	static FString FrameTiming(float TargetFPS = 60.0f);
 
 	/**
+	 * TEST/VALIDATION HELPER -- deliberately induce a frame hitch on a chosen thread so you can verify
+	 * that FrameTiming's verdict, budget gate and contested detection fire correctly against a KNOWN
+	 * ground truth. The hitch is applied over the next `Frames` rendered frames, so run FrameTiming on a
+	 * following frame to read the spike (the thread times reflect the last COMPLETED frame).
+	 *
+	 *   Thread = "game"   -> stall the game thread   `Milliseconds` ms/frame  (expect bound=GameThread)
+	 *   Thread = "render" -> stall the render thread `Milliseconds` ms/frame  (expect bound=RenderThread)
+	 *   Thread = "both"   -> stall game AND render by the same amount         (expect contested=true)
+	 *   Thread = "gpu"    -> supersample via r.ScreenPercentage to force GPU cost, auto-restored after
+	 *                        `Frames` frames (scene-dependent best-effort; `Milliseconds` is ignored).
+	 *
+	 * @param Thread       "game" (default), "render", "both", or "gpu".
+	 * @param Milliseconds Stall size per frame for the CPU threads. Clamped to [1, 5000]. Ignored for gpu.
+	 * @param Frames       Consecutive frames to sustain the hitch. Clamped to [1, 600]. Use >1 to simulate
+	 *                     sustained jitter instead of a single spike.
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "BoundHound|Performance")
+	static FString ForceHitch(const FString& Thread = TEXT("game"), float Milliseconds = 250.0f, int32 Frames = 1);
+
+	/**
 	 * Start an Unreal Insights trace to file.
 	 * @param Name Trace file name (without extension).
 	 * @param Channels Comma-separated trace channels; empty uses the default set (frame,cpu,gpu,log,...).
