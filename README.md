@@ -56,6 +56,7 @@ Pass a target to gate against a different frame rate: `frame_timing(120)`. When 
 | Method | Purpose |
 |--------|---------|
 | `frame_timing()` | Game/Render/GPU/RHI thread ms + a CPU-vs-GPU `bound` verdict and `hint`. **Run first.** |
+| `force_hitch(thread="game", milliseconds=250, frames=1)` | Test helper: deliberately stall `game`/`render`/`both`/`gpu` so you can confirm `frame_timing` catches it. |
 | `start_trace(name, channels)` | Start an Unreal Insights trace to file (default channel set if `channels` empty). |
 | `stop_trace()` | Stop the active trace; returns file path + size. |
 | `get_trace_status()` | Whether a trace is active and which channels are enabled. |

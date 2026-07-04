@@ -7,6 +7,7 @@ from Python with no C++ required. Run everything here from the editor's Python c
 | Method | Purpose |
 |--------|---------|
 | `frame_timing(target_fps=60)` | Game/Render/GPU/RHI thread ms + a robust CPU-vs-GPU `bound` verdict, a `hint`, and a per-thread `budget` pass/fail gate against `target_fps`. **Run FIRST.** |
+| `force_hitch(thread="game", milliseconds=250, frames=1)` | **Test/validation helper.** Deliberately induce a hitch on a known thread, then confirm `frame_timing` reads it back correctly. See [Validating the verdict](#-validating-the-verdict-force_hitch). |
 | `start_trace(name="mcp_capture", channels="")` | Start an Insights trace to file (default channel set if `channels` empty). |
 | `stop_trace()` | Stop the active trace; returns the trace file path + size. |
 | `get_trace_status()` | Whether a trace is active and which channels are enabled. |
@@ -76,6 +77,36 @@ per-frame budget, so the gate reports each thread's headroom plus an overall `ve
 
 Gate a CI/perf check on `result["budget"]["meets_target"]`, and read `over_budget` per thread to see
 exactly which one blew the budget.
+
+## 🧪 Validating the verdict (`force_hitch`)
+
+`force_hitch` is a **test instrument**: it deliberately stalls a known thread so you can confirm
+`frame_timing` names the right bottleneck. Fire it, then read `frame_timing` on a following frame and
+check the reading matches — that's your regression check for the verdict logic itself.
+
+```python
+import unreal, json
+# Force a 250 ms game-thread hitch, then confirm the verdict:
+print(json.loads(unreal.BoundHoundService.force_hitch("game", 250)))   # -> {"expect": "bound=GameThread", ...}
+print(json.loads(unreal.BoundHoundService.frame_timing()))             # bound should read "GameThread"
+```
+
+The validation matrix — force each, expect the paired verdict:
+
+| `thread` | What it stalls | Expect from `frame_timing` |
+|----------|----------------|-----------------------------|
+| `game`   | Game thread, `milliseconds`/frame | `bound: "GameThread"` |
+| `render` | Render thread, `milliseconds`/frame | `bound: "RenderThread"` |
+| `both`   | Game **and** render, equal size | `contested: true`, `contested_with` set |
+| `gpu`    | Supersamples via `r.ScreenPercentage` (auto-restored) | `bound: "GPU"` *if the scene's GPU cost tips past CPU — scene-dependent* |
+
+Notes:
+- Thread times reflect the **last completed frame**, so read `frame_timing` at least one frame *after*
+  `force_hitch` (the `hint` in the response says so).
+- `frames > 1` sustains the hitch across N frames — use it to reproduce **jitter**, not just a single spike.
+- `milliseconds` is clamped to `[1, 5000]` and `frames` to `[1, 600]` so a typo can't lock the editor.
+- `gpu` is best-effort: on a trivial PIE scene even 4× supersampling may not overtake the CPU threads.
+  Prefer profiling in a representative/worst spot.
 
 ## ⏱️ Frame-time budgets
 
