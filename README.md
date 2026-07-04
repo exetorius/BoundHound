@@ -68,6 +68,10 @@ Pass a target to gate against a different frame rate: `frame_timing(120)`. When 
 
 All methods return a JSON string. Full workflow and gotchas in [`docs/USAGE.md`](docs/USAGE.md).
 
+## AI Assistant skill (zero setup)
+
+The plugin ships a native **AgentSkill** (`UBoundHoundTriageSkill`) that teaches UE 5.8's AI Assistant *how* to use these tools — the strategy layer on top of the per-tool descriptions (frame_timing first → interpret the verdict → act per thread → trace → validate with force_hitch). Because UE discovers skills by scanning `UAgentSkill` subclasses (native classes included) and the default allow/block lists are empty, it is **auto-registered on plugin load** — no content asset, no config. The Assistant finds it via `list_skills` and reads it via `get_skills`.
+
 ## Recommended flow
 
 ```python
