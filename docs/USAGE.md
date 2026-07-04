@@ -6,7 +6,7 @@ from Python with no C++ required. Run everything here from the editor's Python c
 
 | Method | Purpose |
 |--------|---------|
-| `frame_timing()` | Game/Render/GPU/RHI thread ms + a CPU-vs-GPU `bound` verdict + a `hint`. **Run FIRST.** |
+| `frame_timing(target_fps=60)` | Game/Render/GPU/RHI thread ms + a robust CPU-vs-GPU `bound` verdict, a `hint`, and a per-thread `budget` pass/fail gate against `target_fps`. **Run FIRST.** |
 | `start_trace(name="mcp_capture", channels="")` | Start an Insights trace to file (default channel set if `channels` empty). |
 | `stop_trace()` | Stop the active trace; returns the trace file path + size. |
 | `get_trace_status()` | Whether a trace is active and which channels are enabled. |
@@ -28,13 +28,54 @@ render-thread bound, and vice-versa.
 
 ```python
 import unreal, json
-result = json.loads(unreal.BoundHoundService.frame_timing())
-print(result)  # game_thread_ms, render_thread_ms, gpu_ms, rhi_thread_ms, frame_ms, bound, hint
+result = json.loads(unreal.BoundHoundService.frame_timing())        # gate against 60 FPS
+result = json.loads(unreal.BoundHoundService.frame_timing(120))     # or any target
+print(result)  # ...thread_ms, frame_ms, bound, bound_confidence, contested, hint, budget
 ```
 
 Start PIE first and park in a representative/worst spot, then call it. It returns the per-thread ms,
 a `bound` verdict (`GameThread` / `RenderThread` / `GPU`), and a `hint` with what to do next — the
 same data the `stat unit` overlay shows, read straight from engine globals.
+
+### The verdict is deliberately cautious
+
+A single frame is noisy, so the verdict tells you *how much to trust it* instead of always declaring
+a winner:
+
+- **`bound_confidence`** — `clear` (bottleneck leads by >10%), `moderate` (a CPU thread wins but GPU
+  timing was unavailable, so a hidden GPU cost can't be ruled out), `marginal` (top two threads are
+  within 10% — a tie), or `none` (no meaningful timing yet).
+- **`contested` / `contested_with`** — when the top two are within ~10 %, `contested` is `true` and
+  `contested_with` names the runner-up. Frame-to-frame noise can flip which one "wins", so treat both
+  as bottlenecks — take several readings or trace both.
+- **`margin_ms`** — how far the bottleneck leads the runner-up, in ms.
+
+If `gpu_ms` is `0` the GPU column is dropped from the ranking (its timing is unavailable that frame),
+and any CPU verdict is downgraded to `moderate` — confirm it with the `r.ScreenPercentage 50` test.
+
+### The budget gate
+
+`frame_timing(target_fps)` also returns a `budget` block that turns the reading into a **pass/fail
+guard**. Because the threads run in parallel, *every* thread must individually finish inside the
+per-frame budget, so the gate reports each thread's headroom plus an overall `verdict`:
+
+```jsonc
+"budget": {
+  "target_fps": 60,
+  "budget_ms": 16.67,
+  "frame_headroom_ms": -8.44,   // negative = over budget
+  "meets_target": false,
+  "verdict": "FAIL",            // PASS when frame_ms <= budget_ms
+  "threads": {
+    "game_thread":   { "ms": 25.1, "headroom_ms": -8.44, "over_budget": true },
+    "render_thread": { "ms": 8.4,  "headroom_ms": 8.27,  "over_budget": false },
+    "gpu":           { "ms": 11.2, "headroom_ms": 5.47,  "over_budget": false }
+  }
+}
+```
+
+Gate a CI/perf check on `result["budget"]["meets_target"]`, and read `over_budget` per thread to see
+exactly which one blew the budget.
 
 ## ⏱️ Frame-time budgets
 

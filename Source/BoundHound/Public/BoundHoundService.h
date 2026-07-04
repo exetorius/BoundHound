@@ -29,9 +29,17 @@ public:
 	 * Report Game/Render/GPU/RHI thread ms + a CPU-vs-GPU bound verdict and hint for the most recently
 	 * rendered frame (the same data as the on-screen "stat unit"). RUN THIS FIRST in any frame-rate
 	 * investigation -- optimising the GPU does nothing if the frame is game- or render-thread bound.
+	 *
+	 * The verdict is robust: when the top two threads are within a small margin it reports the frame as
+	 * "contested" with a confidence level rather than declaring a false winner, and it flags when GPU
+	 * timing is unavailable (gpu_ms == 0) so you don't trust a CPU verdict that GPU could overturn.
+	 *
+	 * Also reports a per-thread budget breakdown against a target frame rate: each thread's headroom
+	 * against the per-frame budget and a pass/fail gate, so the same call that triages can also guard.
+	 * @param TargetFPS Frame-rate budget to gate against (e.g. 60, 120). Defaults to 60.
 	 */
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "BoundHound|Performance")
-	static FString FrameTiming();
+	static FString FrameTiming(float TargetFPS = 60.0f);
 
 	/**
 	 * Start an Unreal Insights trace to file.
