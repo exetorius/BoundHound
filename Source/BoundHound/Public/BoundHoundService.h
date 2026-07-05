@@ -112,4 +112,23 @@ public:
 	/** Report whether a standalone session is running and which trace/log it is writing. */
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "BoundHound|Performance")
 	static FString GetStandaloneStatus();
+
+	/**
+	 * Start Play-In-Editor IN-PROCESS (inside the editor's own process) so FrameTiming and ForceHitch
+	 * read the live PIE game world. This is what makes the in-process CPU-hitch validation land:
+	 * ForceHitch's game/render stalls only take effect when a game world is actually ticking.
+	 *
+	 * PREFER StartStandalone for real stall identification. PIE is NOT representative -- it shares the
+	 * editor's already-warm shader/PSO caches and on-demand cooked data, so it hides costs a standalone
+	 * or shipping build actually pays. Use PIE for quick in-process checks and for validating the
+	 * verdict/hitch logic against a live world; use Standalone when the numbers have to be trusted.
+	 *
+	 * PIE starts on the next editor tick, so read FrameTiming on a FOLLOWING frame (pie_running flips true).
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "BoundHound|Performance")
+	static FString StartPIE();
+
+	/** Stop the in-process Play-In-Editor session started with StartPIE. Tears down on the next tick. */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "BoundHound|Performance")
+	static FString StopPIE();
 };
