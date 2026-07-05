@@ -14,8 +14,9 @@ from Python with no C++ required. Run everything here from the editor's Python c
 | `bookmark(name)` | Drop a point-in-time bookmark in the active trace. |
 | `region_start(name)` / `region_end(name)` | Begin / end a named region span in the active trace. |
 | `analyse(source="both", file="")` | Read back trace and/or log → frame stats, worst frames, hitches, notable log lines. |
-| `start_standalone(name, channels)` | Launch the game as a separate standalone process with a trace attached. |
+| `start_standalone(name, channels)` | Launch the game as a separate standalone process with a trace attached. Writes its own **timestamped log** (`<name>_<YYYYMMDD_HHMMSS>.log`) via `-abslog`, so `analyse("logs")` reads the standalone's log, not the editor's locked one. |
 | `stop_standalone()` / `get_standalone_status()` | Control / inspect the standalone capture. |
+| `start_pie()` / `stop_pie()` | Start/stop **in-process** Play-In-Editor (opens a PIE window in the editor process). Makes `frame_timing`/`force_hitch` read a live game world. See [PIE vs Standalone](#-pie-vs-standalone). |
 
 All methods return a JSON string. For a representative reading, profile under PIE or a standalone
 session, not the bare editor viewport.
@@ -101,12 +102,40 @@ The validation matrix — force each, expect the paired verdict:
 | `gpu`    | Supersamples via `r.ScreenPercentage` (auto-restored) | `bound: "GPU"` *if the scene's GPU cost tips past CPU — scene-dependent* |
 
 Notes:
+- **`force_hitch`'s CPU stalls need a live game world.** The game/render stalls only take effect while a
+  world is ticking, so `start_pie()` (or a standalone session) must be running — on the bare editor
+  viewport the game/render cases don't land. Only the `gpu` case affects the editor viewport.
 - Thread times reflect the **last completed frame**, so read `frame_timing` at least one frame *after*
   `force_hitch` (the `hint` in the response says so).
+- **Confirming a CPU hitch over MCP/Python is racy.** The hitch produces a *visible* spike in the
+  on-screen `stat unit`, but the in-process reader (`frame_timing`) shares the game thread with the
+  stall, so a follow-up call reliably lands on a clean frame and reports a normal number. Trust
+  `stat unit` (or a trace) as ground truth for the CPU cases; the `gpu` case reads back cleanly.
 - `frames > 1` sustains the hitch across N frames — use it to reproduce **jitter**, not just a single spike.
 - `milliseconds` is clamped to `[1, 5000]` and `frames` to `[1, 600]` so a typo can't lock the editor.
-- `gpu` is best-effort: on a trivial PIE scene even 4× supersampling may not overtake the CPU threads.
+- `gpu` is best-effort: on a trivial scene even 4× supersampling may not overtake the CPU threads.
   Prefer profiling in a representative/worst spot.
+
+## 🎬 PIE vs Standalone
+
+`frame_timing` and `force_hitch` need a **live game world** — the bare editor viewport isn't one. Two
+ways to get one, and they are **not** equivalent:
+
+| | `start_pie()` | `start_standalone()` |
+|---|---|---|
+| Process | In the editor process (a PIE window) | Separate game process |
+| Reads via `frame_timing`/`force_hitch` | ✅ in-process, immediate | ❌ (separate process — use the trace + `analyse`) |
+| Shader/PSO caches | **Warm** — reuses the editor's | Cold, like a real build |
+| Representative of shipping cost | ❌ hides costs | ✅ closest to real |
+| Best for | Quick in-process checks, verdict/hitch logic | **Real stall identification** |
+
+**Rule of thumb: identify stalls in Standalone, not PIE.** PIE shares the editor's already-warm
+shader/PSO caches and on-demand cooked data, so it under-reports exactly the hitches you're hunting.
+`start_pie()` exists for fast in-process sanity checks (and so `force_hitch` has a world to stall);
+when the numbers have to be trusted, capture a `start_standalone()` trace and `analyse()` it.
+
+> This project has a **~30 s load hitch** on standalone startup — give a standalone session 45–60 s
+> before stopping so your capture reflects steady-state, not loading.
 
 ## ⏱️ Frame-time budgets
 

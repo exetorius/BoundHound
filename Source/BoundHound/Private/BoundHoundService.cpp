@@ -262,6 +262,13 @@ static FString AnalyseLogs(const FString& LogFile)
 	FString Content;
 	if (!FFileHelper::LoadFileToString(Content, *LogFile))
 	{
+		// LoadFileToString fails both when the file is absent AND when it exists but is locked open by
+		// another process (e.g. the editor's own live log). Distinguish the two so the caller isn't
+		// misled into thinking a present-but-locked log is missing.
+		if (FPaths::FileExists(LogFile))
+		{
+			return ErrJson(TEXT("LOG_LOCKED"), FString::Printf(TEXT("Log file exists but could not be read (likely held open by another process): %s"), *LogFile));
+		}
 		return ErrJson(TEXT("LOG_NOT_FOUND"), FString::Printf(TEXT("Log file not found: %s"), *LogFile));
 	}
 
@@ -731,11 +738,20 @@ FString UBoundHoundService::StartStandalone(const FString& Name, const FString& 
 	const FString ChannelSet = Channels.IsEmpty() ? FString(DefaultTraceChannels()) : Channels;
 	FString TracePath = BuildTraceFilePath(TraceName);
 	GLastTraceFilePath = TracePath + TEXT(".utrace");
-	GLastLogFilePath   = ProjectSavedDirAbs() / TEXT("Logs") / (FApp::GetProjectName() + FString(TEXT(".log")));
+
+	// Give the standalone process its own timestamped log via -abslog, rather than sharing the
+	// project's default <Project>.log. That file is held open by the running editor, so LoadFileToString
+	// fails on it (surfacing as a misleading LOG_NOT_FOUND) and a "newest log in the folder" guess picks
+	// the editor's live log instead of the standalone's. A dedicated, unique path is unlocked and exact.
+	FString LogDir = ProjectSavedDirAbs() / TEXT("Logs");
+	IPlatformFile::GetPlatformPhysical().CreateDirectoryTree(*LogDir);
+	FString StandaloneLogPath = LogDir / FString::Printf(TEXT("%s_%s.log"),
+		*TraceName, *FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S")));
+	GLastLogFilePath = StandaloneLogPath;
 
 	FString ExtraArgs = FString::Printf(
-		TEXT("-tracehost=127.0.0.1 -trace=%s -tracefile=\"%s\""),
-		*ChannelSet, *TracePath);
+		TEXT("-tracehost=127.0.0.1 -trace=%s -tracefile=\"%s\" -abslog=\"%s\""),
+		*ChannelSet, *TracePath, *StandaloneLogPath);
 
 	FRequestPlaySessionParams P;
 	P.SessionDestination = EPlaySessionDestinationType::NewProcess;
@@ -791,25 +807,9 @@ FString UBoundHoundService::StopStandalone()
 	FString UTSTrace = FindLatestUTSTrace();
 	if (!UTSTrace.IsEmpty()) GLastTraceFilePath = UTSTrace;
 
-	{
-		FString LogDir = ProjectSavedDirAbs() / TEXT("Logs");
-		FString NewestLog;
-		FDateTime NewestTime = FDateTime::MinValue();
-		IFileManager::Get().IterateDirectory(*LogDir, [&](const TCHAR* Path, bool bDir) -> bool
-		{
-			if (!bDir && FPaths::GetExtension(Path).Equals(TEXT("log"), ESearchCase::IgnoreCase))
-			{
-				FString Fname = FPaths::GetCleanFilename(Path);
-				if (!Fname.Contains(TEXT("backup")) && !Fname.Contains(TEXT("cef")))
-				{
-					FDateTime T = IFileManager::Get().GetTimeStamp(Path);
-					if (T > NewestTime) { NewestTime = T; NewestLog = Path; }
-				}
-			}
-			return true;
-		});
-		if (!NewestLog.IsEmpty()) GLastLogFilePath = NewestLog;
-	}
+	// GLastLogFilePath was set to a dedicated timestamped file in StartStandalone (-abslog), so it is
+	// already the standalone's own log -- no need to guess the newest log in the folder (which would
+	// pick the editor's live, locked log).
 
 	TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
 	R->SetStringField(TEXT("status"),     TEXT("standalone stop requested"));
@@ -826,5 +826,35 @@ FString UBoundHoundService::GetStandaloneStatus()
 	R->SetBoolField(TEXT("running"), GStandaloneRunning);
 	R->SetStringField(TEXT("last_trace_file"), GLastTraceFilePath);
 	R->SetStringField(TEXT("last_log_file"),   GLastLogFilePath);
+	return OkJson(R);
+}
+
+FString UBoundHoundService::StartPIE()
+{
+	if (!GEditor) return ErrJson(TEXT("NO_EDITOR"), TEXT("GEditor not available."));
+	if (IsPIERunning()) return ErrJson(TEXT("ALREADY_RUNNING"), TEXT("PIE is already running. Call StopPIE first."));
+
+	FRequestPlaySessionParams P;
+	P.SessionDestination = EPlaySessionDestinationType::InProcess;   // in-process, unlike StartStandalone's NewProcess
+	P.WorldType          = EPlaySessionWorldType::PlayInEditor;
+	GEditor->RequestPlaySession(P);
+
+	TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("status"), TEXT("PIE start requested"));
+	R->SetStringField(TEXT("note"),   TEXT("PIE starts on the next editor tick -- call FrameTiming on a FOLLOWING frame (pie_running flips true). Because PIE is IN-PROCESS, ForceHitch game/render stalls now land and FrameTiming reads the live game world."));
+	R->SetStringField(TEXT("caveat"), TEXT("PIE is NOT representative for real stall identification -- it reuses the editor's warm shader/PSO caches and on-demand cooked data, hiding costs a standalone/shipping build pays. For trustworthy stall numbers use StartStandalone."));
+	R->SetStringField(TEXT("hint"),   TEXT("StartTrace before your workload if you want a capture, then StopPIE and Analyse."));
+	return OkJson(R);
+}
+
+FString UBoundHoundService::StopPIE()
+{
+	if (!GEditor) return ErrJson(TEXT("NO_EDITOR"), TEXT("GEditor not available."));
+	if (!IsPIERunning()) return ErrJson(TEXT("NOT_RUNNING"), TEXT("PIE is not running."));
+	GEditor->RequestEndPlayMap();
+
+	TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("status"), TEXT("PIE end requested"));
+	R->SetStringField(TEXT("hint"),   TEXT("PIE tears down on the next tick. If you were tracing, StopTrace then Analyse."));
 	return OkJson(R);
 }
