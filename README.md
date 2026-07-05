@@ -198,6 +198,18 @@ bare editor viewport — start PIE for a representative reading, same as the Pyt
 
 BoundHound is a single `UToolsetDefinition` subclass exposing static `AICallable` methods. On startup it auto-registers itself with UE 5.8's native `ToolsetRegistry`, so the methods show up both in Python (`unreal.BoundHoundService.*`) and on the engine's AI/MCP toolset surface. The frame split is read straight from engine globals (`GGameThreadTime` / `GRenderThreadTime` / `RHIGetGPUFrameCycles`) — the same data behind the `stat unit` overlay — so there are no screenshots to OCR and it works headless.
 
+## Testing
+
+BoundHound ships a headless automation suite over the verdict + budget logic. Run it after any
+non-trivial change and before promoting work — one command, no editor window, no GPU:
+
+```powershell
+# from Plugins/BoundHound/ (build the editor target first)
+./RunTests.ps1     # -> Result: succeeded=10 failed=0 notRun=0 ; exits non-zero on failure
+```
+
+Full details, coverage, and how to add a test: [`docs/TESTING.md`](docs/TESTING.md).
+
 ## License
 
 MIT — see [LICENSE](LICENSE). Do whatever you like with it.
