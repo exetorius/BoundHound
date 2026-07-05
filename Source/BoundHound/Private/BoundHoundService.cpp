@@ -1,6 +1,7 @@
 // Copyright (c) 2026 exetorius. Released under the MIT License.
 
 #include "BoundHoundService.h"
+#include "BoundHoundVerdict.h"
 #include "Json.h"
 #include "Misc/Paths.h"
 #include "Misc/FileHelper.h"
@@ -397,34 +398,18 @@ FString UBoundHoundService::FrameTiming(float TargetFPS)
 	R->SetNumberField(TEXT("fps"), FrameMs > 0.0 ? Round2(1000.0 / FrameMs) : 0.0);
 
 	// --- Robust verdict -------------------------------------------------------
-	// Rank the candidate threads (GPU only counts when its timing is available), then judge how
-	// decisive the winner is. Two threads within CONTESTED_PCT of each other are a genuine tie: the
-	// noise between frames can flip them, so we report "contested" rather than an over-confident pick.
-	struct FThread { const TCHAR* Name; double Ms; };
-	TArray<FThread, TInlineAllocator<3>> Threads;
-	Threads.Add({ TEXT("GameThread"),   GameMs });
-	Threads.Add({ TEXT("RenderThread"), RenderMs });
-	if (bGpuAvailable) Threads.Add({ TEXT("GPU"), GpuMs });
-	Threads.Sort([](const FThread& A, const FThread& B) { return A.Ms > B.Ms; });
-
-	const FString Bound = Threads[0].Name;
-	const double TopMs    = Threads[0].Ms;
-	const double RunnerMs = Threads.Num() > 1 ? Threads[1].Ms : 0.0;
-	const FString RunnerName = Threads.Num() > 1 ? FString(Threads[1].Name) : FString();
-	const double MarginMs = TopMs - RunnerMs;
-
-	// Margin as a fraction of the bottleneck cost -- a 0.3 ms gap means a lot at 3 ms and nothing at 30.
-	constexpr double CONTESTED_PCT = 0.10; // top must lead the runner-up by >10% to be a clear win
-	const bool bContested = TopMs > 0.0 && (MarginMs / TopMs) < CONTESTED_PCT;
-
-	FString Confidence;
-	if (TopMs <= 0.0)                       Confidence = TEXT("none");     // no meaningful timing yet
-	else if (bContested)                    Confidence = TEXT("marginal");
-	else if (!bGpuAvailable)                Confidence = TEXT("moderate"); // CPU winner, but GPU unknown
-	else                                    Confidence = TEXT("clear");
+	// Rank the candidate threads (GPU only counts when its timing is available) and judge how decisive
+	// the winner is. Pure logic lives in BoundHoundVerdict::Classify so it can be unit-tested headless.
+	const BoundHoundVerdict::FVerdict Verdict = BoundHoundVerdict::Classify(GameMs, RenderMs, GpuMs, bGpuAvailable);
+	const FString Bound      = Verdict.Bound;
+	const double  TopMs      = Verdict.TopMs;
+	const double  RunnerMs   = Verdict.RunnerMs;
+	const FString RunnerName = Verdict.RunnerName;
+	const double  MarginMs   = Verdict.MarginMs;
+	const bool    bContested = Verdict.bContested;
 
 	R->SetStringField(TEXT("bound"), Bound);
-	R->SetStringField(TEXT("bound_confidence"), Confidence);
+	R->SetStringField(TEXT("bound_confidence"), Verdict.Confidence);
 	R->SetNumberField(TEXT("margin_ms"), Round2(MarginMs));
 	R->SetBoolField(TEXT("contested"), bContested);
 
@@ -448,11 +433,11 @@ FString UBoundHoundService::FrameTiming(float TargetFPS)
 	// FPS is 1000/frame_ms, and the threads run in parallel, so EACH thread must individually finish
 	// inside the per-frame budget. Report every thread's headroom against the target and gate on the
 	// bottleneck -- this is what turns a one-shot reading into a pass/fail guard.
-	const double SafeTargetFps = (FMath::IsFinite(TargetFPS) && TargetFPS > 0.0f) ? (double)TargetFPS : 60.0;
-	const double BudgetMs = 1000.0 / SafeTargetFps;
+	const BoundHoundVerdict::FBudget Gate = BoundHoundVerdict::ComputeBudget(FrameMs, TargetFPS);
+	const double BudgetMs = Gate.BudgetMs;
 
 	TSharedPtr<FJsonObject> Budget = MakeShared<FJsonObject>();
-	Budget->SetNumberField(TEXT("target_fps"), Round2(SafeTargetFps));
+	Budget->SetNumberField(TEXT("target_fps"), Round2(Gate.TargetFps));
 	Budget->SetNumberField(TEXT("budget_ms"), Round2(BudgetMs));
 
 	auto ThreadBudget = [&](double Ms, bool bAvailable) -> TSharedPtr<FJsonValue>
@@ -462,7 +447,7 @@ FString UBoundHoundService::FrameTiming(float TargetFPS)
 		if (bAvailable)
 		{
 			T->SetNumberField(TEXT("headroom_ms"), Round2(BudgetMs - Ms));
-			T->SetBoolField(TEXT("over_budget"), Ms > BudgetMs);
+			T->SetBoolField(TEXT("over_budget"), BoundHoundVerdict::IsOverBudget(Ms, BudgetMs));
 		}
 		else
 		{
@@ -477,15 +462,15 @@ FString UBoundHoundService::FrameTiming(float TargetFPS)
 	PerThread->SetField(TEXT("gpu"),           ThreadBudget(GpuMs, bGpuAvailable));
 	Budget->SetObjectField(TEXT("threads"), PerThread);
 
-	Budget->SetNumberField(TEXT("frame_headroom_ms"), Round2(BudgetMs - FrameMs));
-	const bool bMeetsTarget = FrameMs > 0.0 && FrameMs <= BudgetMs;
+	Budget->SetNumberField(TEXT("frame_headroom_ms"), Round2(Gate.FrameHeadroomMs));
+	const bool bMeetsTarget = Gate.bMeetsTarget;
 	Budget->SetBoolField(TEXT("meets_target"), bMeetsTarget);
 	Budget->SetStringField(TEXT("verdict"), bMeetsTarget ? TEXT("PASS") : TEXT("FAIL"));
 	if (!bMeetsTarget && FrameMs > 0.0)
 	{
 		Budget->SetStringField(TEXT("budget_note"), FString::Printf(
 			TEXT("%s is %.2f ms over the %.2f ms budget for %g FPS -- that thread alone caps you at ~%.0f FPS. Fix the bottleneck thread, not whichever is cheapest."),
-			*Bound, TopMs - BudgetMs, BudgetMs, SafeTargetFps, FrameMs > 0.0 ? 1000.0 / FrameMs : 0.0));
+			*Bound, TopMs - BudgetMs, BudgetMs, Gate.TargetFps, FrameMs > 0.0 ? 1000.0 / FrameMs : 0.0));
 	}
 	R->SetObjectField(TEXT("budget"), Budget);
 
