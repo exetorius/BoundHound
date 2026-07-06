@@ -4,7 +4,7 @@
 
 Unreal 5.8's native AI toolsets ship with **no** performance or tracing tools. BoundHound is a small, self-contained editor plugin that fills the gap: a one-call CPU-vs-GPU **bound verdict**, scripted Unreal Insights trace capture, and trace+log analysis — all callable from Python or the engine's native AI toolset (no C++ required to _use_ it).
 
-> The golden rule of profiling: **never optimize before you know which processor is the bottleneck.** A frame is roughly `max(GameThread, RenderThread, GPU)` — only the longest one sets your FPS. Cutting GPU cost does nothing if you're game-thread bound. BoundHound makes that verdict the _first_ thing you see.
+> The golden rule of profiling: **never optimize before you know which processor is the bottleneck.** A frame is roughly `max(GameThread, RenderThread, RHIThread, GPU)` — only the longest one sets your FPS. Cutting GPU cost does nothing if you're game-thread bound. BoundHound makes that verdict the _first_ thing you see.
 
 ---
 

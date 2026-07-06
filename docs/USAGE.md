@@ -24,7 +24,7 @@ session, not the bare editor viewport.
 ## 🚦 STEP 0 — Is it CPU-bound or GPU-bound? (DO THIS FIRST, ALWAYS)
 
 **Never optimise before you know which processor is the bottleneck.** Frame time is roughly
-`max(GameThread, RenderThread, GPU)` — these run in parallel, so only the *longest* one sets your FPS.
+`max(GameThread, RenderThread, RHIThread, GPU)` — these run in parallel, so only the *longest* one sets your FPS.
 Cutting GPU cost (shadows, Lumen, post-process) does **nothing** if the frame is game- or
 render-thread bound, and vice-versa.
 
@@ -36,7 +36,7 @@ print(result)  # ...thread_ms, frame_ms, bound, bound_confidence, contested, hin
 ```
 
 Start PIE first and park in a representative/worst spot, then call it. It returns the per-thread ms,
-a `bound` verdict (`GameThread` / `RenderThread` / `GPU`), and a `hint` with what to do next — the
+a `bound` verdict (`GameThread` / `RenderThread` / `RHIThread` / `GPU`), and a `hint` with what to do next — the
 same data the `stat unit` overlay shows, read straight from engine globals.
 
 ### The verdict is deliberately cautious
@@ -169,6 +169,7 @@ code and Blueprints:
 |---|---|
 | **GameThread** | Tick / Blueprint / AI / animation. `stat dumpframe -ms=0.5 -root=gamethread`. Fix is code/Blueprint, not CVars. |
 | **RenderThread** | Draw calls & primitives, dynamic shadow-casting lights. `stat scenerendering`. Instance/merge meshes, Nanite, cut dynamic lights. |
+| **RHIThread** | GPU-command submission (distinct from render-thread scene setup). Usually too many draw calls / state changes. `stat rhi`, draw-call count in `stat scenerendering`. Cut draw calls via merging/instancing/HISM, Nanite. *Only ranked when RHI-threading is on; otherwise its cost folds into RenderThread.* |
 | **GPU** | *Now* run `ProfileGPU`. Shadows (VSM), Lumen, translucency, resolution. |
 
 ## ⚠️ Gotchas

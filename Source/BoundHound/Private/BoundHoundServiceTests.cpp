@@ -29,7 +29,7 @@ bool FBoundHoundVerdictClearTest::RunTest(const FString&)
 
 	// Game clearly slowest -> GameThread, clear, runner-up is the next-slowest (GPU at 11).
 	{
-		const FVerdict V = Classify(25.0, 8.0, 11.0, /*bGpuAvailable*/ true);
+		const FVerdict V = Classify(25.0, 8.0, /*Rhi*/ 0.0, 11.0, /*bRhi*/ false, /*bGpuAvailable*/ true);
 		TestEqual(TEXT("game bound"), V.Bound, FString(TEXT("GameThread")));
 		TestEqual(TEXT("game confidence"), V.Confidence, FString(TEXT("clear")));
 		TestFalse(TEXT("game not contested"), V.bContested);
@@ -38,15 +38,30 @@ bool FBoundHoundVerdictClearTest::RunTest(const FString&)
 	}
 	// Render clearly slowest.
 	{
-		const FVerdict V = Classify(8.0, 25.0, 11.0, true);
+		const FVerdict V = Classify(8.0, 25.0, 0.0, 11.0, false, true);
 		TestEqual(TEXT("render bound"), V.Bound, FString(TEXT("RenderThread")));
 		TestEqual(TEXT("render confidence"), V.Confidence, FString(TEXT("clear")));
 	}
 	// GPU clearly slowest.
 	{
-		const FVerdict V = Classify(8.0, 11.0, 25.0, true);
+		const FVerdict V = Classify(8.0, 11.0, 0.0, 25.0, false, true);
 		TestEqual(TEXT("gpu bound"), V.Bound, FString(TEXT("GPU")));
 		TestEqual(TEXT("gpu confidence"), V.Confidence, FString(TEXT("clear")));
+	}
+	// RHI clearly slowest (RHI-threading on) -> a distinct RHI-bound verdict.
+	{
+		const FVerdict V = Classify(8.0, 11.0, /*Rhi*/ 25.0, 9.0, /*bRhi*/ true, true);
+		TestEqual(TEXT("rhi bound"), V.Bound, FString(TEXT("RHIThread")));
+		TestEqual(TEXT("rhi confidence"), V.Confidence, FString(TEXT("clear")));
+		TestFalse(TEXT("rhi not contested"), V.bContested);
+		TestEqual(TEXT("rhi runner-up is render"), V.RunnerName, FString(TEXT("RenderThread")));
+	}
+	// RHI available but not the winner -> existing game verdict is unchanged, RHI just joins the ranking.
+	{
+		const FVerdict V = Classify(25.0, 8.0, /*Rhi*/ 9.0, 11.0, /*bRhi*/ true, true);
+		TestEqual(TEXT("still game bound"), V.Bound, FString(TEXT("GameThread")));
+		TestEqual(TEXT("still clear"), V.Confidence, FString(TEXT("clear")));
+		TestFalse(TEXT("rhi present but not contested"), V.bContested);
 	}
 	return true;
 }
@@ -58,16 +73,22 @@ bool FBoundHoundVerdictContestedTest::RunTest(const FString&)
 	using namespace BoundHoundVerdict;
 
 	// Top two within 10% -> a tie: contested, confidence downgraded to marginal, runner-up named.
-	const FVerdict V = Classify(25.0, 24.0, 5.0, true);
+	const FVerdict V = Classify(25.0, 24.0, 0.0, 5.0, false, true);
 	TestEqual(TEXT("bound is the nominal top"), V.Bound, FString(TEXT("GameThread")));
 	TestTrue(TEXT("contested"), V.bContested);
 	TestEqual(TEXT("confidence marginal"), V.Confidence, FString(TEXT("marginal")));
 	TestEqual(TEXT("contested_with"), V.RunnerName, FString(TEXT("RenderThread")));
 
 	// marginal (tie) must win over moderate (GPU-unavailable) when both apply.
-	const FVerdict M = Classify(10.0, 9.5, 0.0, /*bGpuAvailable*/ false);
+	const FVerdict M = Classify(10.0, 9.5, 0.0, 0.0, false, /*bGpuAvailable*/ false);
 	TestTrue(TEXT("tie contested even w/o gpu"), M.bContested);
 	TestEqual(TEXT("marginal beats moderate"), M.Confidence, FString(TEXT("marginal")));
+
+	// RHI can contest the render thread -> contested tie names RHIThread as the runner-up.
+	const FVerdict R = Classify(8.0, 25.0, /*Rhi*/ 24.0, 5.0, /*bRhi*/ true, true);
+	TestEqual(TEXT("render nominally top"), R.Bound, FString(TEXT("RenderThread")));
+	TestTrue(TEXT("render/rhi contested"), R.bContested);
+	TestEqual(TEXT("contested_with rhi"), R.RunnerName, FString(TEXT("RHIThread")));
 	return true;
 }
 
@@ -78,12 +99,12 @@ bool FBoundHoundVerdictBoundaryTest::RunTest(const FString&)
 	using namespace BoundHoundVerdict;
 
 	// Exactly 10% margin is NOT contested (strict < CONTESTED_PCT). 10 vs 9 -> 1/10 == 0.10 -> clear.
-	const FVerdict V = Classify(10.0, 9.0, 3.0, true);
+	const FVerdict V = Classify(10.0, 9.0, 0.0, 3.0, false, true);
 	TestFalse(TEXT("exactly 10% is not contested"), V.bContested);
 	TestEqual(TEXT("boundary is clear"), V.Confidence, FString(TEXT("clear")));
 
 	// Just inside 10% (9.5/10 -> margin 0.5, 5%) IS contested.
-	const FVerdict C = Classify(10.0, 9.5, 3.0, true);
+	const FVerdict C = Classify(10.0, 9.5, 0.0, 3.0, false, true);
 	TestTrue(TEXT("just under 10% is contested"), C.bContested);
 	return true;
 }
@@ -96,11 +117,16 @@ bool FBoundHoundVerdictGpuUnavailableTest::RunTest(const FString&)
 
 	// GPU timing unavailable: GPU is dropped from the ranking, and a clear CPU winner is downgraded to
 	// "moderate" because a hidden GPU cost can't be ruled out.
-	const FVerdict V = Classify(25.0, 8.0, 0.0, /*bGpuAvailable*/ false);
+	const FVerdict V = Classify(25.0, 8.0, 0.0, 0.0, false, /*bGpuAvailable*/ false);
 	TestEqual(TEXT("bound game"), V.Bound, FString(TEXT("GameThread")));
 	TestEqual(TEXT("confidence moderate"), V.Confidence, FString(TEXT("moderate")));
 	TestFalse(TEXT("not contested"), V.bContested);
 	TestEqual(TEXT("runner is render (gpu excluded)"), V.RunnerName, FString(TEXT("RenderThread")));
+
+	// RHI unavailable must NOT downgrade confidence (its work was counted on the render thread) -- only a
+	// missing GPU number does. GPU present + RHI absent + clear CPU winner stays "clear".
+	const FVerdict G = Classify(25.0, 8.0, /*Rhi*/ 0.0, 11.0, /*bRhi*/ false, /*bGpuAvailable*/ true);
+	TestEqual(TEXT("rhi-absent stays clear"), G.Confidence, FString(TEXT("clear")));
 	return true;
 }
 
@@ -111,7 +137,7 @@ bool FBoundHoundVerdictNoneTest::RunTest(const FString&)
 	using namespace BoundHoundVerdict;
 
 	// No meaningful timing yet -> confidence "none", not contested.
-	const FVerdict V = Classify(0.0, 0.0, 0.0, true);
+	const FVerdict V = Classify(0.0, 0.0, 0.0, 0.0, false, true);
 	TestEqual(TEXT("confidence none"), V.Confidence, FString(TEXT("none")));
 	TestFalse(TEXT("zero not contested"), V.bContested);
 	return true;
@@ -226,7 +252,8 @@ bool FBoundHoundFrameTimingShapeTest::RunTest(const FString&)
 
 	// The live bound must be one of the known verdicts (or none when there's no timing).
 	const FString Bound = Obj->GetStringField(TEXT("bound"));
-	const bool bKnown = Bound == TEXT("GameThread") || Bound == TEXT("RenderThread") || Bound == TEXT("GPU");
+	const bool bKnown = Bound == TEXT("GameThread") || Bound == TEXT("RenderThread")
+		|| Bound == TEXT("RHIThread") || Bound == TEXT("GPU");
 	TestTrue(FString::Printf(TEXT("bound is a known thread: %s"), *Bound), bKnown);
 	return true;
 }

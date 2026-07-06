@@ -43,7 +43,7 @@ routes through, so the tests exercise the **same code the shipping method runs**
 
 | Area | Cases |
 |---|---|
-| **Verdict** (`Classify`) | clear GameThread / RenderThread / GPU; contested/`marginal` tie (incl. marginal-beats-moderate); the exact-10% boundary (not contested) vs just-inside; GPU-unavailable → `moderate` (GPU dropped from ranking); no-timing → `none` |
+| **Verdict** (`Classify`) | clear GameThread / RenderThread / RHIThread / GPU; RHI ranked only when available (wins / present-but-not-winning / contests render thread / absent-doesn't-downgrade); contested/`marginal` tie (incl. marginal-beats-moderate); the exact-10% boundary (not contested) vs just-inside; GPU-unavailable → `moderate` (GPU dropped from ranking); no-timing → `none` |
 | **Budget** (`ComputeBudget` / `IsOverBudget`) | pass/fail gate; zero-frame is not a pass; alternate target FPS; invalid-FPS fallback to 60; per-thread over-budget incl. the exact-budget boundary |
 | **Live smoke** | `FrameTiming` JSON contract (required fields, `bound` is a known thread); `ForceHitch` input validation (`BAD_THREAD`) |
 

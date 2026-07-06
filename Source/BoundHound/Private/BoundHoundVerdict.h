@@ -12,7 +12,7 @@ namespace BoundHoundVerdict
 	// Result of classifying which thread bounds the frame. Mirrors the fields FrameTiming emits.
 	struct FVerdict
 	{
-		FString Bound;          // "GameThread" | "RenderThread" | "GPU"
+		FString Bound;          // "GameThread" | "RenderThread" | "RHIThread" | "GPU"
 		FString Confidence;     // "clear" | "moderate" | "marginal" | "none"
 		double  TopMs = 0.0;    // the bottleneck thread's ms
 		double  RunnerMs = 0.0; // the runner-up's ms
@@ -24,15 +24,20 @@ namespace BoundHoundVerdict
 	// Top must lead the runner-up by more than this fraction of its own cost to be a clear win.
 	static constexpr double CONTESTED_PCT = 0.10;
 
-	// Rank game/render/GPU (GPU only when its timing is available), then judge how decisive the winner is.
-	// RHI is deliberately NOT ranked here -- FrameTiming reports rhi_thread_ms but the verdict is a
-	// game/render/GPU decision, matching the shipping behaviour. (Adding RHI to the verdict is issue #2.)
-	inline FVerdict Classify(double GameMs, double RenderMs, double GpuMs, bool bGpuAvailable)
+	// Rank game/render/RHI/GPU, then judge how decisive the winner is. RHI and GPU each count only when
+	// their timing is available: GRHIThreadTime is 0 when RHI-threading is off (its cost then folds into the
+	// render thread, so ranking it would double-count), and GPU timing isn't always present. RHI IS a real
+	// distinct bottleneck -- draw-call submission can saturate it independently of render-thread scene setup
+	// (issue #2). Note only GPU-unavailable downgrades confidence to "moderate": a missing GPU number hides a
+	// possible bottleneck, whereas missing RHI just means its work was already counted on the render thread.
+	inline FVerdict Classify(double GameMs, double RenderMs, double RhiMs, double GpuMs,
+	                         bool bRhiAvailable, bool bGpuAvailable)
 	{
 		struct FThread { const TCHAR* Name; double Ms; };
-		TArray<FThread, TInlineAllocator<3>> Threads;
+		TArray<FThread, TInlineAllocator<4>> Threads;
 		Threads.Add({ TEXT("GameThread"),   GameMs });
 		Threads.Add({ TEXT("RenderThread"), RenderMs });
+		if (bRhiAvailable) Threads.Add({ TEXT("RHIThread"), RhiMs });
 		if (bGpuAvailable) Threads.Add({ TEXT("GPU"), GpuMs });
 		Threads.Sort([](const FThread& A, const FThread& B) { return A.Ms > B.Ms; });
 

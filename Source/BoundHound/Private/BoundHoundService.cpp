@@ -374,6 +374,10 @@ static FString BoundHint(const FString& Bound)
 	{
 		return TEXT("CPU render-thread bound. Usual cause: too many draw calls / primitives, or many dynamic shadow-casting lights. Check 'stat scenerendering'. Levers: merge/instance meshes, enable Nanite, cut dynamic lights and per-light shadows. NOTE: dropping r.ScreenPercentage will NOT help a render-thread-bound frame.");
 	}
+	if (Bound == TEXT("RHIThread"))
+	{
+		return TEXT("CPU RHI-thread bound -- the thread submitting GPU commands is the bottleneck, distinct from render-thread scene setup. Usual cause: too many draw calls / state changes saturating command submission. Check 'stat rhi' and 'stat scenerendering' (draw-call count). Levers: cut draw calls via merging/instancing/HISM, enable Nanite, reduce material/state permutations. NOTE: dropping r.ScreenPercentage will NOT help an RHI-thread-bound frame.");
+	}
 	return TEXT("CPU game-thread bound. Usual cause: Tick / Blueprint / AI / animation cost. Run 'stat dumpframe -ms=0.5 -root=gamethread' on the PIE world then read the result. Levers: throttle/disable unnecessary Tick, reduce ticking actors & AI, cut expensive Blueprint tick logic. NOTE: dropping r.ScreenPercentage will NOT help a game-thread-bound frame.");
 }
 
@@ -392,15 +396,18 @@ FString UBoundHoundService::FrameTiming(float TargetFPS)
 	R->SetNumberField(TEXT("rhi_thread_ms"),    Round2(RHIMs));
 	R->SetNumberField(TEXT("gpu_ms"),           Round2(GpuMs));
 
+	const bool bRhiAvailable = RHIMs > 0.0;
 	const bool bGpuAvailable = GpuMs > 0.0;
-	const double FrameMs = FMath::Max3(GameMs, RenderMs, GpuMs);
+	// Every ranked thread runs in parallel, so the frame is bounded by the slowest of them. RHIMs/GpuMs are
+	// 0 when unavailable, so Max is safe -- an absent thread can never be the max.
+	const double FrameMs = FMath::Max(FMath::Max3(GameMs, RenderMs, GpuMs), RHIMs);
 	R->SetNumberField(TEXT("frame_ms"), Round2(FrameMs));
 	R->SetNumberField(TEXT("fps"), FrameMs > 0.0 ? Round2(1000.0 / FrameMs) : 0.0);
 
 	// --- Robust verdict -------------------------------------------------------
 	// Rank the candidate threads (GPU only counts when its timing is available) and judge how decisive
 	// the winner is. Pure logic lives in BoundHoundVerdict::Classify so it can be unit-tested headless.
-	const BoundHoundVerdict::FVerdict Verdict = BoundHoundVerdict::Classify(GameMs, RenderMs, GpuMs, bGpuAvailable);
+	const BoundHoundVerdict::FVerdict Verdict = BoundHoundVerdict::Classify(GameMs, RenderMs, RHIMs, GpuMs, bRhiAvailable, bGpuAvailable);
 	const FString Bound      = Verdict.Bound;
 	const double  TopMs      = Verdict.TopMs;
 	const double  RunnerMs   = Verdict.RunnerMs;
