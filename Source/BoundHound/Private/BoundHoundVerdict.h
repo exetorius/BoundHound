@@ -88,4 +88,20 @@ namespace BoundHoundVerdict
 		B.bMeetsTarget     = FrameMs > 0.0 && FrameMs <= B.BudgetMs;
 		return B;
 	}
+
+	// Race-free self-validation for ForceHitch (issue #17). Given the peak per-thread ms the hitch
+	// actually induced -- measured synchronously by ForceHitch itself, NOT read back via a follow-up
+	// FrameTiming that races the stall on the game thread -- did the stall land on the thread(s) the
+	// caller asked for? MinExpectedMs is the floor a thread's induced time must clear to count as hit
+	// (set below the requested stall to tolerate scheduler slop). "gpu" is not validated here: its cost
+	// is scene-dependent and can't be measured synchronously, so it keeps the read-a-following-frame path.
+	inline bool HitchMatchesExpect(const FString& Mode, double PeakGameMs, double PeakRenderMs, double MinExpectedMs)
+	{
+		const bool bGameHit   = PeakGameMs   >= MinExpectedMs;
+		const bool bRenderHit = PeakRenderMs >= MinExpectedMs;
+		if (Mode == TEXT("game"))   return bGameHit   && PeakGameMs   > PeakRenderMs;
+		if (Mode == TEXT("render")) return bRenderHit && PeakRenderMs > PeakGameMs;
+		if (Mode == TEXT("both"))   return bGameHit   && bRenderHit;
+		return false; // gpu / unknown -- not self-validated by induced CPU peaks
+	}
 }

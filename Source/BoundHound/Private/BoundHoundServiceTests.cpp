@@ -277,4 +277,58 @@ bool FBoundHoundForceHitchValidationTest::RunTest(const FString&)
 	return true;
 }
 
+// Race-free self-validation logic (issue #17): given the peak per-thread ms a hitch induced, decide
+// whether it landed on the requested thread(s). Pure -> exercised headless, no live timing.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundHitchExpectTest,
+	"BoundHound.ForceHitch.MatchesExpect", kBHTestFlags)
+bool FBoundHoundHitchExpectTest::RunTest(const FString&)
+{
+	using namespace BoundHoundVerdict;
+	const double Min = 125.0; // half of a 250 ms stall
+
+	// game: game peak clears the floor AND dominates render -> match; render untouched must not match "game".
+	TestTrue (TEXT("game hit"),          HitchMatchesExpect(TEXT("game"),   250.0,   0.0, Min));
+	TestFalse(TEXT("game undershoot"),   HitchMatchesExpect(TEXT("game"),    50.0,   0.0, Min));
+	TestFalse(TEXT("game but render bigger"), HitchMatchesExpect(TEXT("game"), 250.0, 300.0, Min));
+
+	// render: symmetric.
+	TestTrue (TEXT("render hit"),        HitchMatchesExpect(TEXT("render"),   0.0, 250.0, Min));
+	TestFalse(TEXT("render undershoot"), HitchMatchesExpect(TEXT("render"),   0.0,  50.0, Min));
+
+	// both: both threads must clear the floor.
+	TestTrue (TEXT("both hit"),          HitchMatchesExpect(TEXT("both"),   250.0, 250.0, Min));
+	TestFalse(TEXT("both one short"),    HitchMatchesExpect(TEXT("both"),   250.0,  50.0, Min));
+
+	// gpu / unknown are never self-validated by CPU peaks.
+	TestFalse(TEXT("gpu not matched here"), HitchMatchesExpect(TEXT("gpu"), 999.0, 999.0, Min));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundForceHitchSelfMeasureTest,
+	"BoundHound.ForceHitch.SelfMeasure", kBHTestFlags)
+bool FBoundHoundForceHitchSelfMeasureTest::RunTest(const FString&)
+{
+	// A game-thread stall must be induced AND measured within the single call: the response carries the
+	// observed peak and verdict_matched_expect=true, with no follow-up FrameTiming (issue #17).
+	const FString Json = UBoundHoundService::ForceHitch(TEXT("game"), 20.0f, 1);
+
+	TSharedPtr<FJsonObject> Obj;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Json);
+	if (!FJsonSerializer::Deserialize(Reader, Obj) || !Obj.IsValid())
+	{
+		AddError(FString::Printf(TEXT("ForceHitch did not return valid JSON: %s"), *Json.Left(200)));
+		return false;
+	}
+
+	TestTrue(TEXT("success"), Obj->GetBoolField(TEXT("success")));
+	TestTrue(TEXT("has observed_peak_game_ms"), Obj->HasField(TEXT("observed_peak_game_ms")));
+	TestTrue(TEXT("has verdict_matched_expect"), Obj->HasField(TEXT("verdict_matched_expect")));
+
+	// The 20 ms sleep should measure at least the 10 ms match floor (sleep never undershoots by half).
+	const double Peak = Obj->GetNumberField(TEXT("observed_peak_game_ms"));
+	TestTrue(FString::Printf(TEXT("induced >= 10ms (got %.1f)"), Peak), Peak >= 10.0);
+	TestTrue(TEXT("verdict matched"), Obj->GetBoolField(TEXT("verdict_matched_expect")));
+	return true;
+}
+
 #endif // WITH_AUTOMATION_TESTS

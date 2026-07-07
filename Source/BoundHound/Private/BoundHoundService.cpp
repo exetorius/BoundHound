@@ -512,55 +512,7 @@ FString UBoundHoundService::ForceHitch(const FString& Thread, float Milliseconds
 	const int32 HitchFrames  = FMath::Clamp(Frames, 1, 600);
 	const float StallSeconds = StallMs / 1000.0f;
 
-	// GPU forcing: supersample by driving r.ScreenPercentage up, restored when the countdown ends. This is
-	// the only scene-agnostic GPU lever we have -- the actual cost still depends on what's on screen, so a
-	// trivial PIE scene may not tip the frame GPU-bound. That's why gpu is documented as best-effort.
-	constexpr float GpuScreenPercentage = 400.0f;
-	float SavedScreenPercentage = 100.0f;
-	IConsoleVariable* ScreenPctCVar = bGpu
-		? IConsoleManager::Get().FindConsoleVariable(TEXT("r.ScreenPercentage"))
-		: nullptr;
-	if (bGpu && ScreenPctCVar)
-	{
-		SavedScreenPercentage = ScreenPctCVar->GetFloat();
-		ScreenPctCVar->Set(GpuScreenPercentage, ECVF_SetByConsole);
-	}
-
-	// One ticker fires once per game-thread frame. It re-applies the stall for HitchFrames frames, then
-	// tears itself down (restoring any GPU cvar it changed). Sleeping inside the ticker runs within the
-	// engine's measured game-thread frame, so GGameThreadTime picks it up -- which is the whole point.
-	TSharedRef<int32> Remaining = MakeShared<int32>(HitchFrames);
-	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
-		[bGame, bRender, bGpu, StallSeconds, Remaining, ScreenPctCVar, SavedScreenPercentage](float) -> bool
-		{
-			if (bGame)
-			{
-				FPlatformProcess::Sleep(StallSeconds);
-			}
-			if (bRender)
-			{
-				const float RtSeconds = StallSeconds;
-				ENQUEUE_RENDER_COMMAND(BoundHoundForceHitch)(
-					[RtSeconds](FRHICommandListImmediate&)
-					{
-						FPlatformProcess::Sleep(RtSeconds);
-					});
-			}
-
-			if (--(*Remaining) > 0)
-			{
-				return true; // keep hitching next frame
-			}
-
-			// Countdown finished -- undo the GPU cost bump and unregister the ticker.
-			if (bGpu && ScreenPctCVar)
-			{
-				ScreenPctCVar->Set(SavedScreenPercentage, ECVF_SetByConsole);
-			}
-			return false;
-		}));
-
-	// Tell the caller exactly what to expect from FrameTiming, so validation is a direct compare.
+	// Tell the caller exactly what to expect from the verdict, so validation is a direct compare.
 	const TCHAR* Expect =
 		  (Mode == TEXT("both"))   ? TEXT("contested=true (GameThread and RenderThread within margin)")
 		: (Mode == TEXT("render"))? TEXT("bound=RenderThread")
@@ -569,14 +521,40 @@ FString UBoundHoundService::ForceHitch(const FString& Thread, float Milliseconds
 
 	TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
 	R->SetStringField(TEXT("forcing"), Mode);
-	R->SetNumberField(TEXT("frames"), HitchFrames);
 	R->SetStringField(TEXT("expect"), Expect);
-	if (bGame || bRender)
-	{
-		R->SetNumberField(TEXT("stall_ms_per_frame"), StallMs);
-	}
+
+	// GPU forcing stays async: supersample by driving r.ScreenPercentage up, restored when the countdown
+	// ends over HitchFrames frames. It's the only scene-agnostic GPU lever we have -- the actual cost still
+	// depends on what's on screen, so a trivial PIE scene may not tip the frame GPU-bound (best-effort). GPU
+	// cost persists across the frames the reader sees, so unlike the CPU paths a follow-up FrameTiming reads
+	// it back cleanly -- which is why gpu keeps the read-a-following-frame flow instead of self-measuring.
 	if (bGpu)
 	{
+		constexpr float GpuScreenPercentage = 400.0f;
+		float SavedScreenPercentage = 100.0f;
+		IConsoleVariable* ScreenPctCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.ScreenPercentage"));
+		if (ScreenPctCVar)
+		{
+			SavedScreenPercentage = ScreenPctCVar->GetFloat();
+			ScreenPctCVar->Set(GpuScreenPercentage, ECVF_SetByConsole);
+		}
+
+		TSharedRef<int32> Remaining = MakeShared<int32>(HitchFrames);
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[Remaining, ScreenPctCVar, SavedScreenPercentage](float) -> bool
+			{
+				if (--(*Remaining) > 0)
+				{
+					return true; // keep the supersample up for the next frame
+				}
+				if (ScreenPctCVar)
+				{
+					ScreenPctCVar->Set(SavedScreenPercentage, ECVF_SetByConsole); // restore + unregister
+				}
+				return false;
+			}));
+
+		R->SetNumberField(TEXT("frames"), HitchFrames);
 		if (ScreenPctCVar)
 		{
 			R->SetNumberField(TEXT("screen_percentage"), GpuScreenPercentage);
@@ -586,12 +564,72 @@ FString UBoundHoundService::ForceHitch(const FString& Thread, float Milliseconds
 		{
 			R->SetStringField(TEXT("gpu_warning"), TEXT("r.ScreenPercentage cvar not found -- GPU load NOT applied."));
 		}
+		if (!IsPIERunning())
+		{
+			R->SetStringField(TEXT("note"), TEXT("PIE is not running -- the GPU load lands on the editor viewport frame. Start PIE for a game-representative validation."));
+		}
+		R->SetStringField(TEXT("hint"), TEXT("GPU cost is scene-dependent and not self-measured -- call FrameTiming on a following frame and confirm bound=GPU. Unlike the CPU paths this reads back cleanly (the GPU cost persists across frames)."));
+		return OkJson(R);
 	}
+
+	// CPU paths (game/render/both) -- SELF-MEASURING, so validation is race-free (issue #17). The old
+	// approach scheduled the stall on a future frame and relied on a follow-up FrameTiming to catch it, but
+	// that read runs on the game thread the stall blocks and reliably lands on a clean frame. Here we apply
+	// the stall synchronously inside this call and time it directly, then return the induced peak per-thread
+	// ms and a verdict_matched_expect flag -- the caller validates from THIS single response, no second call.
+	// Cap total synchronous blocking so a fat-fingered frames*ms can't freeze the editor for minutes.
+	constexpr double TotalCapMs = 10000.0;
+	const int32 EffectiveFrames = FMath::Min(HitchFrames, FMath::Max(1, (int32)(TotalCapMs / StallMs)));
+
+	double PeakGameMs = 0.0;
+	double PeakRenderMs = 0.0;
+	for (int32 i = 0; i < EffectiveFrames; ++i)
+	{
+		if (bGame)
+		{
+			const double T0 = FPlatformTime::Seconds();
+			FPlatformProcess::Sleep(StallSeconds);
+			PeakGameMs = FMath::Max(PeakGameMs, (FPlatformTime::Seconds() - T0) * 1000.0);
+		}
+		if (bRender)
+		{
+			// Stall the render thread and have IT time its own sleep into a shared slot; FlushRenderingCommands
+			// blocks the game thread until that command completes, so the measurement is done before we read it.
+			TSharedRef<double, ESPMode::ThreadSafe> RtMs = MakeShared<double, ESPMode::ThreadSafe>(0.0);
+			const float RtSeconds = StallSeconds;
+			ENQUEUE_RENDER_COMMAND(BoundHoundForceHitch)(
+				[RtSeconds, RtMs](FRHICommandListImmediate&)
+				{
+					const double T0 = FPlatformTime::Seconds();
+					FPlatformProcess::Sleep(RtSeconds);
+					*RtMs = (FPlatformTime::Seconds() - T0) * 1000.0;
+				});
+			FlushRenderingCommands();
+			PeakRenderMs = FMath::Max(PeakRenderMs, *RtMs);
+		}
+	}
+
+	// A thread counts as "hit" if it induced at least half the requested stall (tolerates scheduler slop).
+	const double MinExpectedMs = 0.5 * StallMs;
+	const bool bMatched = BoundHoundVerdict::HitchMatchesExpect(Mode, PeakGameMs, PeakRenderMs, MinExpectedMs);
+
+	R->SetNumberField(TEXT("frames"), EffectiveFrames);
+	if (EffectiveFrames < HitchFrames)
+	{
+		R->SetNumberField(TEXT("frames_requested"), HitchFrames);
+		R->SetStringField(TEXT("frames_note"), FString::Printf(
+			TEXT("Capped to %d frame(s) (~%.0f ms total) so the synchronous stall can't freeze the editor."),
+			EffectiveFrames, TotalCapMs));
+	}
+	R->SetNumberField(TEXT("stall_ms_per_frame"), StallMs);
+	if (bGame)   { R->SetNumberField(TEXT("observed_peak_game_ms"), PeakGameMs); }
+	if (bRender) { R->SetNumberField(TEXT("observed_peak_render_ms"), PeakRenderMs); }
+	R->SetBoolField(TEXT("verdict_matched_expect"), bMatched);
 	if (!IsPIERunning())
 	{
-		R->SetStringField(TEXT("note"), TEXT("PIE is not running -- the hitch lands on the editor viewport frame. Start PIE for a game-representative validation."));
+		R->SetStringField(TEXT("note"), TEXT("PIE is not running -- the stall was still induced and measured directly on the editor frame, so verdict_matched_expect is valid. Start PIE for a game-representative FrameTiming reading."));
 	}
-	R->SetStringField(TEXT("hint"), TEXT("Now call FrameTiming (on a following frame) and confirm the reading matches 'expect'. Thread times reflect the last COMPLETED frame, so read at least one frame after this call."));
+	R->SetStringField(TEXT("hint"), TEXT("Validation is self-contained: 'verdict_matched_expect' compares the stall this call actually induced ('observed_peak_*_ms') against 'expect' -- no follow-up FrameTiming needed (that read races the stall on the game thread and misses it)."));
 	return OkJson(R);
 }
 

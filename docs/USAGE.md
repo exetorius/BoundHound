@@ -7,7 +7,7 @@ from Python with no C++ required. Run everything here from the editor's Python c
 | Method | Purpose |
 |--------|---------|
 | `frame_timing(target_fps=60)` | Game/Render/GPU/RHI thread ms + a robust CPU-vs-GPU `bound` verdict, a `hint`, and a per-thread `budget` pass/fail gate against `target_fps`. **Run FIRST.** |
-| `force_hitch(thread="game", milliseconds=250, frames=1)` | **Test/validation helper.** Deliberately induce a hitch on a known thread, then confirm `frame_timing` reads it back correctly. See [Validating the verdict](#-validating-the-verdict-force_hitch). |
+| `force_hitch(thread="game", milliseconds=250, frames=1)` | **Test/validation helper.** Deliberately induce a hitch on a known thread. CPU paths self-validate in one call (`observed_peak_*_ms` + `verdict_matched_expect`); `gpu` reads back via `frame_timing`. See [Validating the verdict](#-validating-the-verdict-force_hitch). |
 | `start_trace(name="mcp_capture", channels="")` | Start an Insights trace to file (default channel set if `channels` empty). |
 | `stop_trace()` | Stop the active trace; returns the trace file path + size. |
 | `get_trace_status()` | Whether a trace is active and which channels are enabled. |
@@ -81,38 +81,42 @@ exactly which one blew the budget.
 
 ## 🧪 Validating the verdict (`force_hitch`)
 
-`force_hitch` is a **test instrument**: it deliberately stalls a known thread so you can confirm
-`frame_timing` names the right bottleneck. Fire it, then read `frame_timing` on a following frame and
-check the reading matches — that's your regression check for the verdict logic itself.
+`force_hitch` is a **test instrument**: it deliberately stalls a known thread so you can confirm the
+verdict logic fires against a known ground truth. The CPU paths (`game`/`render`/`both`) are
+**self-validating** — the stall is applied synchronously and timed inside the call, so a *single*
+response tells you whether it landed. No follow-up `frame_timing` (see the race note below).
 
 ```python
 import unreal, json
-# Force a 250 ms game-thread hitch, then confirm the verdict:
-print(json.loads(unreal.BoundHoundService.force_hitch("game", 250)))   # -> {"expect": "bound=GameThread", ...}
-print(json.loads(unreal.BoundHoundService.frame_timing()))             # bound should read "GameThread"
+# Force a 250 ms game-thread hitch and read the result from the SAME call:
+r = json.loads(unreal.BoundHoundService.force_hitch("game", 250))
+# -> {"expect": "bound=GameThread", "observed_peak_game_ms": ~250, "verdict_matched_expect": true, ...}
+assert r["verdict_matched_expect"]
 ```
 
-The validation matrix — force each, expect the paired verdict:
+The validation matrix — force each, expect the paired result:
 
-| `thread` | What it stalls | Expect from `frame_timing` |
-|----------|----------------|-----------------------------|
-| `game`   | Game thread, `milliseconds`/frame | `bound: "GameThread"` |
-| `render` | Render thread, `milliseconds`/frame | `bound: "RenderThread"` |
-| `both`   | Game **and** render, equal size | `contested: true`, `contested_with` set |
-| `gpu`    | Supersamples via `r.ScreenPercentage` (auto-restored) | `bound: "GPU"` *if the scene's GPU cost tips past CPU — scene-dependent* |
+| `thread` | What it stalls | Self-validates via | Expect |
+|----------|----------------|--------------------|--------|
+| `game`   | Game thread, `milliseconds`/frame | `observed_peak_game_ms` + `verdict_matched_expect` | game peak ≥ ½ stall & dominates → `true` |
+| `render` | Render thread, `milliseconds`/frame | `observed_peak_render_ms` + `verdict_matched_expect` | render peak ≥ ½ stall & dominates → `true` |
+| `both`   | Game **and** render, equal size | both peaks + `verdict_matched_expect` | both peaks ≥ ½ stall → `true` |
+| `gpu`    | Supersamples via `r.ScreenPercentage` (auto-restored) | *follow-up* `frame_timing` | `bound: "GPU"` *if scene GPU cost tips past CPU — scene-dependent* |
 
 Notes:
-- **`force_hitch`'s CPU stalls need a live game world.** The game/render stalls only take effect while a
-  world is ticking, so `start_pie()` (or a standalone session) must be running — on the bare editor
-  viewport the game/render cases don't land. Only the `gpu` case affects the editor viewport.
-- Thread times reflect the **last completed frame**, so read `frame_timing` at least one frame *after*
-  `force_hitch` (the `hint` in the response says so).
-- **Confirming a CPU hitch over MCP/Python is racy.** The hitch produces a *visible* spike in the
-  on-screen `stat unit`, but the in-process reader (`frame_timing`) shares the game thread with the
-  stall, so a follow-up call reliably lands on a clean frame and reports a normal number. Trust
-  `stat unit` (or a trace) as ground truth for the CPU cases; the `gpu` case reads back cleanly.
-- `frames > 1` sustains the hitch across N frames — use it to reproduce **jitter**, not just a single spike.
-- `milliseconds` is clamped to `[1, 5000]` and `frames` to `[1, 600]` so a typo can't lock the editor.
+- **The CPU paths are race-free (issue #17).** Earlier, confirming a CPU hitch meant a follow-up
+  `frame_timing`, but that reader runs on the game thread the stall blocks, so it reliably landed on a
+  clean frame and missed the spike (the stall was real — visible in `stat unit` — just unread). Now
+  `force_hitch` times its *own* stall and returns `observed_peak_*_ms` + `verdict_matched_expect`, so
+  validation needs no second call.
+- **`gpu` is the exception** — its cost is scene-dependent and persists across frames, so it can't be
+  measured synchronously but *does* read back cleanly: for `gpu` alone, call `frame_timing` on a
+  following frame and confirm `bound: "GPU"`.
+- A live game world makes the reading representative — `start_pie()` or a standalone — but the CPU
+  self-measurement holds even on the bare editor viewport (the stall is induced and timed directly).
+- `frames > 1` sustains the hitch across N applications (simulate **jitter**); CPU total is capped at
+  ~10 s of synchronous stall so a typo can't lock the editor (response reports `frames_requested` if capped).
+- `milliseconds` is clamped to `[1, 5000]` and `frames` to `[1, 600]`.
 - `gpu` is best-effort: on a trivial scene even 4× supersampling may not overtake the CPU threads.
   Prefer profiling in a representative/worst spot.
 

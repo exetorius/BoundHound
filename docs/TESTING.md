@@ -16,7 +16,7 @@ That boots `UnrealEditor-Cmd` against the host project, runs every test under th
 **exits non-zero if anything fails** (so it drops straight into CI). Expected:
 
 ```
-Result: succeeded=10 failed=0 notRun=0
+Result: succeeded=12 failed=0 notRun=0
 ```
 
 Overridable params: `-EnginePath`, `-Project`, `-Filter`. The raw incantation, if the script isn't handy:
@@ -45,10 +45,13 @@ routes through, so the tests exercise the **same code the shipping method runs**
 |---|---|
 | **Verdict** (`Classify`) | clear GameThread / RenderThread / RHIThread / GPU; RHI ranked only when available (wins / present-but-not-winning / contests render thread / absent-doesn't-downgrade); contested/`marginal` tie (incl. marginal-beats-moderate); the exact-10% boundary (not contested) vs just-inside; GPU-unavailable → `moderate` (GPU dropped from ranking); no-timing → `none` |
 | **Budget** (`ComputeBudget` / `IsOverBudget`) | pass/fail gate; zero-frame is not a pass; alternate target FPS; invalid-FPS fallback to 60; per-thread over-budget incl. the exact-budget boundary |
-| **Live smoke** | `FrameTiming` JSON contract (required fields, `bound` is a known thread); `ForceHitch` input validation (`BAD_THREAD`) |
+| **Hitch match** (`HitchMatchesExpect`) | race-free self-validation logic (issue #17): game/render/both hit vs undershoot vs wrong-thread-dominates; gpu not self-validated by CPU peaks |
+| **Live smoke** | `FrameTiming` JSON contract (required fields, `bound` is a known thread); `ForceHitch` input validation (`BAD_THREAD`); `ForceHitch` self-measure (`game` induces & measures its own stall → `observed_peak_game_ms` + `verdict_matched_expect`) |
 
-Not covered by unit tests (needs a live world / eyeball or a trace): the `ForceHitch` render/both
-mappings and bookmark/region trace markers — see the `force_hitch` notes in [`USAGE.md`](USAGE.md).
+Not covered by unit tests (needs a live world / eyeball or a trace): the `ForceHitch` **gpu** mapping
+(scene-dependent, reads back via a following-frame `FrameTiming`) and bookmark/region trace markers —
+see the `force_hitch` notes in [`USAGE.md`](USAGE.md). The CPU render/both stalls are now self-measured,
+so their pass/fail logic *is* covered headless.
 
 ## Adding a test
 

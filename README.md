@@ -76,7 +76,7 @@ The incumbents win on *depth* — once you know **where** to look, Insights and 
 | Method | Purpose |
 |--------|---------|
 | `frame_timing()` | Game/Render/GPU/RHI thread ms + a CPU-vs-GPU `bound` verdict and `hint`. **Run first.** |
-| `force_hitch(thread="game", milliseconds=250, frames=1)` | Test helper: deliberately stall `game`/`render`/`both`/`gpu` so you can confirm `frame_timing` catches it. |
+| `force_hitch(thread="game", milliseconds=250, frames=1)` | Test helper: deliberately stall `game`/`render`/`both`/`gpu`. CPU paths self-validate in one call (`verdict_matched_expect`); `gpu` reads back via `frame_timing`. |
 | `start_trace(name, channels)` | Start an Unreal Insights trace to file (default channel set if `channels` empty). |
 | `stop_trace()` | Stop the active trace; returns file path + size. |
 | `get_trace_status()` | Whether a trace is active and which channels are enabled. |
@@ -89,14 +89,13 @@ The incumbents win on *depth* — once you know **where** to look, Insights and 
 
 All methods return a JSON string. Full workflow and gotchas in [`docs/USAGE.md`](docs/USAGE.md).
 
-> **PIE vs Standalone.** `force_hitch`'s CPU stalls (and any game-thread reading) only mean something
-> when a game world is actually ticking, so `frame_timing`/`force_hitch` need either `start_pie()` or a
-> standalone session — not the bare editor viewport. **Prefer `start_standalone()` for real stall
-> identification**: PIE reuses the editor's already-warm shader/PSO caches and on-demand cooked data, so
-> it hides costs a standalone or shipping build actually pays. Use PIE for quick in-process checks.
-> (Note: `force_hitch` produces a *visible* spike in `stat unit`, but confirming it with a follow-up
-> `frame_timing` call over the same in-process channel is racy — the reader shares the game thread with
-> the stall — so eyeball `stat unit` for ground truth.)
+> **PIE vs Standalone.** A live game world makes any `frame_timing` reading representative, so prefer
+> `start_pie()` or a standalone session over the bare editor viewport. **Prefer `start_standalone()` for
+> real stall identification**: PIE reuses the editor's already-warm shader/PSO caches and on-demand cooked
+> data, so it hides costs a standalone or shipping build actually pays. Use PIE for quick in-process checks.
+> (Note: `force_hitch`'s CPU paths are **self-validating** — they time their own stall and return
+> `verdict_matched_expect`, so no racy follow-up `frame_timing` is needed; only `gpu` reads back via a
+> following-frame `frame_timing`.)
 
 ## AI Assistant skill (zero setup)
 
@@ -205,7 +204,7 @@ non-trivial change and before promoting work — one command, no editor window, 
 
 ```powershell
 # from Plugins/BoundHound/ (build the editor target first)
-./RunTests.ps1     # -> Result: succeeded=10 failed=0 notRun=0 ; exits non-zero on failure
+./RunTests.ps1     # -> Result: succeeded=12 failed=0 notRun=0 ; exits non-zero on failure
 ```
 
 Full details, coverage, and how to add a test: [`docs/TESTING.md`](docs/TESTING.md).
