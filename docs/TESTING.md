@@ -16,7 +16,7 @@ That boots `UnrealEditor-Cmd` against the host project, runs every test under th
 **exits non-zero if anything fails** (so it drops straight into CI). Expected:
 
 ```
-Result: succeeded=12 failed=0 notRun=0
+Result: succeeded=14 failed=0 notRun=0
 ```
 
 Overridable params: `-EnginePath`, `-Project`, `-Filter`. The raw incantation, if the script isn't handy:
@@ -45,13 +45,17 @@ routes through, so the tests exercise the **same code the shipping method runs**
 |---|---|
 | **Verdict** (`Classify`) | clear GameThread / RenderThread / RHIThread / GPU; RHI ranked only when available (wins / present-but-not-winning / contests render thread / absent-doesn't-downgrade); contested/`marginal` tie (incl. marginal-beats-moderate); the exact-10% boundary (not contested) vs just-inside; GPU-unavailable → `moderate` (GPU dropped from ranking); no-timing → `none` |
 | **Budget** (`ComputeBudget` / `IsOverBudget`) | pass/fail gate; zero-frame is not a pass; alternate target FPS; invalid-FPS fallback to 60; per-thread over-budget incl. the exact-budget boundary |
-| **Hitch match** (`HitchMatchesExpect`) | race-free self-validation logic (issue #17): game/render/both hit vs undershoot vs wrong-thread-dominates; gpu not self-validated by CPU peaks |
-| **Live smoke** | `FrameTiming` JSON contract (required fields, `bound` is a known thread); `ForceHitch` input validation (`BAD_THREAD`); `ForceHitch` self-measure (`game` induces & measures its own stall → `observed_peak_game_ms` + `verdict_matched_expect`) |
+| **Hitch match** (`HitchMatchesExpect`) | race-free self-validation logic (issue #17): game/render/both hit vs undershoot vs wrong-thread-dominates; the `rhi` arm (issue #2: rhi peak clears floor AND dominates both CPU threads → match, else miss); gpu not self-validated by CPU peaks |
+| **Live smoke** | `FrameTiming` JSON contract (required fields, `bound` is a known thread); `ForceHitch` input validation (`BAD_THREAD`); `ForceHitch` self-measure (`game` induces & measures its own stall → `observed_peak_game_ms` + `verdict_matched_expect`); `ForceHitch` `rhi` arm (asserts the nullrhi fallback: `rhi_threading:false` + no false match when there's no separate RHI thread); `Report` writes a real self-contained file headless (`included_capture:false` no-capture path, non-empty file on disk, then cleans up) |
 
 Not covered by unit tests (needs a live world / eyeball or a trace): the `ForceHitch` **gpu** mapping
-(scene-dependent, reads back via a following-frame `FrameTiming`) and bookmark/region trace markers —
-see the `force_hitch` notes in [`USAGE.md`](USAGE.md). The CPU render/both stalls are now self-measured,
-so their pass/fail logic *is* covered headless.
+(scene-dependent, reads back via a following-frame `FrameTiming`); the `ForceHitch` **rhi** live
+RHIThread-*wins* path (headless `-nullrhi` has no separate RHI thread, so only the pure match logic and
+the RHI-off fallback are covered — the live win needs a session with `r.RHIThread.Enable 1`); the
+**Report HTML layout** itself (only its JSON contract — `report_file`/`included_capture`/`fix_count` —
+is asserted; the rendered page is eyeballed); and bookmark/region trace markers — see the `force_hitch`
+notes in [`USAGE.md`](USAGE.md). The CPU render/both stalls are now self-measured, so their pass/fail
+logic *is* covered headless.
 
 ## Adding a test
 
