@@ -95,13 +95,19 @@ namespace BoundHoundVerdict
 	// caller asked for? MinExpectedMs is the floor a thread's induced time must clear to count as hit
 	// (set below the requested stall to tolerate scheduler slop). "gpu" is not validated here: its cost
 	// is scene-dependent and can't be measured synchronously, so it keeps the read-a-following-frame path.
-	inline bool HitchMatchesExpect(const FString& Mode, double PeakGameMs, double PeakRenderMs, double MinExpectedMs)
+	// "rhi" self-validates only when RHI-threading is on (a distinct RHI thread exists to stall); the peak
+	// must clear the floor AND dominate both CPU threads, or the stall folded into the render thread and
+	// there's no RHIThread verdict to confirm (issue #2).
+	inline bool HitchMatchesExpect(const FString& Mode, double PeakGameMs, double PeakRenderMs,
+	                               double MinExpectedMs, double PeakRhiMs = 0.0)
 	{
 		const bool bGameHit   = PeakGameMs   >= MinExpectedMs;
 		const bool bRenderHit = PeakRenderMs >= MinExpectedMs;
+		const bool bRhiHit    = PeakRhiMs    >= MinExpectedMs;
 		if (Mode == TEXT("game"))   return bGameHit   && PeakGameMs   > PeakRenderMs;
 		if (Mode == TEXT("render")) return bRenderHit && PeakRenderMs > PeakGameMs;
 		if (Mode == TEXT("both"))   return bGameHit   && bRenderHit;
+		if (Mode == TEXT("rhi"))    return bRhiHit    && PeakRhiMs > PeakRenderMs && PeakRhiMs > PeakGameMs;
 		return false; // gpu / unknown -- not self-validated by induced CPU peaks
 	}
 }

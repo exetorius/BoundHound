@@ -300,6 +300,13 @@ bool FBoundHoundHitchExpectTest::RunTest(const FString&)
 	TestTrue (TEXT("both hit"),          HitchMatchesExpect(TEXT("both"),   250.0, 250.0, Min));
 	TestFalse(TEXT("both one short"),    HitchMatchesExpect(TEXT("both"),   250.0,  50.0, Min));
 
+	// rhi: the RHI peak (5th arg) must clear the floor AND dominate both CPU threads (issue #2).
+	TestTrue (TEXT("rhi hit"),           HitchMatchesExpect(TEXT("rhi"),      0.0,   0.0, Min, /*Rhi*/ 250.0));
+	TestFalse(TEXT("rhi undershoot"),    HitchMatchesExpect(TEXT("rhi"),      0.0,   0.0, Min, /*Rhi*/  50.0));
+	TestFalse(TEXT("rhi but render bigger"), HitchMatchesExpect(TEXT("rhi"),  0.0, 300.0, Min, /*Rhi*/ 250.0));
+	// rhi with no RHI peak (threading off -> stall folded into render) must not falsely match.
+	TestFalse(TEXT("rhi threading off"), HitchMatchesExpect(TEXT("rhi"),      0.0, 250.0, Min, /*Rhi*/   0.0));
+
 	// gpu / unknown are never self-validated by CPU peaks.
 	TestFalse(TEXT("gpu not matched here"), HitchMatchesExpect(TEXT("gpu"), 999.0, 999.0, Min));
 	return true;
@@ -329,6 +336,38 @@ bool FBoundHoundForceHitchSelfMeasureTest::RunTest(const FString&)
 	const double Peak = Obj->GetNumberField(TEXT("observed_peak_game_ms"));
 	TestTrue(FString::Printf(TEXT("induced >= 10ms (got %.1f)"), Peak), Peak >= 10.0);
 	TestTrue(TEXT("verdict matched"), Obj->GetBoolField(TEXT("verdict_matched_expect")));
+	return true;
+}
+
+// The rhi arm (issue #2) is a ground-truth trigger for the RHIThread verdict. Headless runs under
+// -nullrhi with no separate RHI thread, so this asserts the graceful fallback: the mode is accepted
+// (not BAD_THREAD), rhi_threading reports false, a warning is surfaced, and nothing was validated. The
+// live RHIThread-wins path can only be confirmed in a session with RHI-threading ON.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundForceHitchRhiTest,
+	"BoundHound.ForceHitch.RhiArm", kBHTestFlags)
+bool FBoundHoundForceHitchRhiTest::RunTest(const FString&)
+{
+	const FString Json = UBoundHoundService::ForceHitch(TEXT("rhi"), 20.0f, 1);
+
+	TSharedPtr<FJsonObject> Obj;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Json);
+	if (!FJsonSerializer::Deserialize(Reader, Obj) || !Obj.IsValid())
+	{
+		AddError(FString::Printf(TEXT("ForceHitch rhi did not return valid JSON: %s"), *Json.Left(200)));
+		return false;
+	}
+
+	// 'rhi' is a valid mode -- accepted, not rejected as BAD_THREAD.
+	TestTrue(TEXT("success"), Obj->GetBoolField(TEXT("success")));
+	TestEqual(TEXT("forcing rhi"), Obj->GetStringField(TEXT("forcing")), FString(TEXT("rhi")));
+	TestTrue(TEXT("has rhi_threading"), Obj->HasField(TEXT("rhi_threading")));
+
+	// Headless nullrhi has no separate RHI thread: expect the flagged fallback, no induced verdict.
+	if (!Obj->GetBoolField(TEXT("rhi_threading")))
+	{
+		TestTrue(TEXT("warns rhi-threading off"), Obj->HasField(TEXT("rhi_warning")));
+		TestFalse(TEXT("nothing validated w/o rhi thread"), Obj->GetBoolField(TEXT("verdict_matched_expect")));
+	}
 	return true;
 }
 

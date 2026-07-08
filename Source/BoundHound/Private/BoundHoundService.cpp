@@ -499,12 +499,13 @@ FString UBoundHoundService::ForceHitch(const FString& Thread, float Milliseconds
 	const FString Mode = Thread.IsEmpty() ? TEXT("game") : Thread.ToLower();
 	const bool bGame   = (Mode == TEXT("game")   || Mode == TEXT("both"));
 	const bool bRender = (Mode == TEXT("render") || Mode == TEXT("both"));
+	const bool bRhi    = (Mode == TEXT("rhi"));
 	const bool bGpu    = (Mode == TEXT("gpu"));
 
-	if (!bGame && !bRender && !bGpu)
+	if (!bGame && !bRender && !bRhi && !bGpu)
 	{
 		return ErrJson(TEXT("BAD_THREAD"), FString::Printf(
-			TEXT("Unknown Thread '%s'. Use 'game', 'render', 'both', or 'gpu'."), *Thread));
+			TEXT("Unknown Thread '%s'. Use 'game', 'render', 'both', 'rhi', or 'gpu'."), *Thread));
 	}
 
 	// Clamp so a fat-fingered value can't freeze the editor for a minute or spin forever.
@@ -516,6 +517,7 @@ FString UBoundHoundService::ForceHitch(const FString& Thread, float Milliseconds
 	const TCHAR* Expect =
 		  (Mode == TEXT("both"))   ? TEXT("contested=true (GameThread and RenderThread within margin)")
 		: (Mode == TEXT("render"))? TEXT("bound=RenderThread")
+		: (Mode == TEXT("rhi"))   ? TEXT("bound=RHIThread WHEN RHI-threading is on; otherwise the stall folds into the render thread (no distinct RHIThread verdict)")
 		: (Mode == TEXT("gpu"))   ? TEXT("bound=GPU IF the scene's GPU cost now exceeds the CPU threads (scene-dependent)")
 		:                           TEXT("bound=GameThread");
 
@@ -581,8 +583,14 @@ FString UBoundHoundService::ForceHitch(const FString& Thread, float Milliseconds
 	constexpr double TotalCapMs = 10000.0;
 	const int32 EffectiveFrames = FMath::Min(HitchFrames, FMath::Max(1, (int32)(TotalCapMs / StallMs)));
 
+	// "rhi" self-measures only when a separate RHI thread exists to stall. With RHI-threading off the RHI
+	// work runs inline on the render thread, so there's no distinct RHIThread to bind the frame -- we skip
+	// the stall and flag it, mirroring how the verdict drops RHI from the ranking in that case (issue #2).
+	const bool bRhiThreaded = bRhi && IsRunningRHIInSeparateThread();
+
 	double PeakGameMs = 0.0;
 	double PeakRenderMs = 0.0;
+	double PeakRhiMs = 0.0;
 	for (int32 i = 0; i < EffectiveFrames; ++i)
 	{
 		if (bGame)
@@ -607,11 +615,32 @@ FString UBoundHoundService::ForceHitch(const FString& Thread, float Milliseconds
 			FlushRenderingCommands();
 			PeakRenderMs = FMath::Max(PeakRenderMs, *RtMs);
 		}
+		if (bRhiThreaded)
+		{
+			// Stall the RHI thread specifically: from the render thread, enqueue a lambda onto the command
+			// list (it executes on the RHI thread when threading is on) that times its own sleep, then flush
+			// the RHI thread so the game thread blocks until that lambda has run and the slot is filled.
+			TSharedRef<double, ESPMode::ThreadSafe> RhMs = MakeShared<double, ESPMode::ThreadSafe>(0.0);
+			const float RhSeconds = StallSeconds;
+			ENQUEUE_RENDER_COMMAND(BoundHoundForceHitchRHI)(
+				[RhSeconds, RhMs](FRHICommandListImmediate& RHICmdList)
+				{
+					RHICmdList.EnqueueLambda([RhSeconds, RhMs](FRHICommandListBase&)
+					{
+						const double T0 = FPlatformTime::Seconds();
+						FPlatformProcess::Sleep(RhSeconds);
+						*RhMs = (FPlatformTime::Seconds() - T0) * 1000.0;
+					});
+					RHICmdList.ImmediateFlush(EImmediateFlushType::FlushRHIThread);
+				});
+			FlushRenderingCommands();
+			PeakRhiMs = FMath::Max(PeakRhiMs, *RhMs);
+		}
 	}
 
 	// A thread counts as "hit" if it induced at least half the requested stall (tolerates scheduler slop).
 	const double MinExpectedMs = 0.5 * StallMs;
-	const bool bMatched = BoundHoundVerdict::HitchMatchesExpect(Mode, PeakGameMs, PeakRenderMs, MinExpectedMs);
+	const bool bMatched = BoundHoundVerdict::HitchMatchesExpect(Mode, PeakGameMs, PeakRenderMs, MinExpectedMs, PeakRhiMs);
 
 	R->SetNumberField(TEXT("frames"), EffectiveFrames);
 	if (EffectiveFrames < HitchFrames)
@@ -624,6 +653,18 @@ FString UBoundHoundService::ForceHitch(const FString& Thread, float Milliseconds
 	R->SetNumberField(TEXT("stall_ms_per_frame"), StallMs);
 	if (bGame)   { R->SetNumberField(TEXT("observed_peak_game_ms"), PeakGameMs); }
 	if (bRender) { R->SetNumberField(TEXT("observed_peak_render_ms"), PeakRenderMs); }
+	if (bRhi)
+	{
+		R->SetBoolField(TEXT("rhi_threading"), bRhiThreaded);
+		if (bRhiThreaded)
+		{
+			R->SetNumberField(TEXT("observed_peak_rhi_ms"), PeakRhiMs);
+		}
+		else
+		{
+			R->SetStringField(TEXT("rhi_warning"), TEXT("RHI-threading is OFF -- no separate RHI thread to stall, so no RHIThread verdict was induced. Re-run with RHI-threading on (r.RHIThread.Enable 1, or a platform where it's default) to validate the RHIThread bound."));
+		}
+	}
 	R->SetBoolField(TEXT("verdict_matched_expect"), bMatched);
 	if (!IsPIERunning())
 	{
