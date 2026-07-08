@@ -374,6 +374,10 @@ static FString BoundHint(const FString& Bound)
 	{
 		return TEXT("CPU render-thread bound. Usual cause: too many draw calls / primitives, or many dynamic shadow-casting lights. Check 'stat scenerendering'. Levers: merge/instance meshes, enable Nanite, cut dynamic lights and per-light shadows. NOTE: dropping r.ScreenPercentage will NOT help a render-thread-bound frame.");
 	}
+	if (Bound == TEXT("RHIThread"))
+	{
+		return TEXT("CPU RHI-thread bound -- the thread submitting GPU commands is the bottleneck, distinct from render-thread scene setup. Usual cause: too many draw calls / state changes saturating command submission. Check 'stat rhi' and 'stat scenerendering' (draw-call count). Levers: cut draw calls via merging/instancing/HISM, enable Nanite, reduce material/state permutations. NOTE: dropping r.ScreenPercentage will NOT help an RHI-thread-bound frame.");
+	}
 	return TEXT("CPU game-thread bound. Usual cause: Tick / Blueprint / AI / animation cost. Run 'stat dumpframe -ms=0.5 -root=gamethread' on the PIE world then read the result. Levers: throttle/disable unnecessary Tick, reduce ticking actors & AI, cut expensive Blueprint tick logic. NOTE: dropping r.ScreenPercentage will NOT help a game-thread-bound frame.");
 }
 
@@ -392,15 +396,18 @@ FString UBoundHoundService::FrameTiming(float TargetFPS)
 	R->SetNumberField(TEXT("rhi_thread_ms"),    Round2(RHIMs));
 	R->SetNumberField(TEXT("gpu_ms"),           Round2(GpuMs));
 
+	const bool bRhiAvailable = RHIMs > 0.0;
 	const bool bGpuAvailable = GpuMs > 0.0;
-	const double FrameMs = FMath::Max3(GameMs, RenderMs, GpuMs);
+	// Every ranked thread runs in parallel, so the frame is bounded by the slowest of them. RHIMs/GpuMs are
+	// 0 when unavailable, so Max is safe -- an absent thread can never be the max.
+	const double FrameMs = FMath::Max(FMath::Max3(GameMs, RenderMs, GpuMs), RHIMs);
 	R->SetNumberField(TEXT("frame_ms"), Round2(FrameMs));
 	R->SetNumberField(TEXT("fps"), FrameMs > 0.0 ? Round2(1000.0 / FrameMs) : 0.0);
 
 	// --- Robust verdict -------------------------------------------------------
 	// Rank the candidate threads (GPU only counts when its timing is available) and judge how decisive
 	// the winner is. Pure logic lives in BoundHoundVerdict::Classify so it can be unit-tested headless.
-	const BoundHoundVerdict::FVerdict Verdict = BoundHoundVerdict::Classify(GameMs, RenderMs, GpuMs, bGpuAvailable);
+	const BoundHoundVerdict::FVerdict Verdict = BoundHoundVerdict::Classify(GameMs, RenderMs, RHIMs, GpuMs, bRhiAvailable, bGpuAvailable);
 	const FString Bound      = Verdict.Bound;
 	const double  TopMs      = Verdict.TopMs;
 	const double  RunnerMs   = Verdict.RunnerMs;
@@ -492,12 +499,13 @@ FString UBoundHoundService::ForceHitch(const FString& Thread, float Milliseconds
 	const FString Mode = Thread.IsEmpty() ? TEXT("game") : Thread.ToLower();
 	const bool bGame   = (Mode == TEXT("game")   || Mode == TEXT("both"));
 	const bool bRender = (Mode == TEXT("render") || Mode == TEXT("both"));
+	const bool bRhi    = (Mode == TEXT("rhi"));
 	const bool bGpu    = (Mode == TEXT("gpu"));
 
-	if (!bGame && !bRender && !bGpu)
+	if (!bGame && !bRender && !bRhi && !bGpu)
 	{
 		return ErrJson(TEXT("BAD_THREAD"), FString::Printf(
-			TEXT("Unknown Thread '%s'. Use 'game', 'render', 'both', or 'gpu'."), *Thread));
+			TEXT("Unknown Thread '%s'. Use 'game', 'render', 'both', 'rhi', or 'gpu'."), *Thread));
 	}
 
 	// Clamp so a fat-fingered value can't freeze the editor for a minute or spin forever.
@@ -505,71 +513,50 @@ FString UBoundHoundService::ForceHitch(const FString& Thread, float Milliseconds
 	const int32 HitchFrames  = FMath::Clamp(Frames, 1, 600);
 	const float StallSeconds = StallMs / 1000.0f;
 
-	// GPU forcing: supersample by driving r.ScreenPercentage up, restored when the countdown ends. This is
-	// the only scene-agnostic GPU lever we have -- the actual cost still depends on what's on screen, so a
-	// trivial PIE scene may not tip the frame GPU-bound. That's why gpu is documented as best-effort.
-	constexpr float GpuScreenPercentage = 400.0f;
-	float SavedScreenPercentage = 100.0f;
-	IConsoleVariable* ScreenPctCVar = bGpu
-		? IConsoleManager::Get().FindConsoleVariable(TEXT("r.ScreenPercentage"))
-		: nullptr;
-	if (bGpu && ScreenPctCVar)
-	{
-		SavedScreenPercentage = ScreenPctCVar->GetFloat();
-		ScreenPctCVar->Set(GpuScreenPercentage, ECVF_SetByConsole);
-	}
-
-	// One ticker fires once per game-thread frame. It re-applies the stall for HitchFrames frames, then
-	// tears itself down (restoring any GPU cvar it changed). Sleeping inside the ticker runs within the
-	// engine's measured game-thread frame, so GGameThreadTime picks it up -- which is the whole point.
-	TSharedRef<int32> Remaining = MakeShared<int32>(HitchFrames);
-	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
-		[bGame, bRender, bGpu, StallSeconds, Remaining, ScreenPctCVar, SavedScreenPercentage](float) -> bool
-		{
-			if (bGame)
-			{
-				FPlatformProcess::Sleep(StallSeconds);
-			}
-			if (bRender)
-			{
-				const float RtSeconds = StallSeconds;
-				ENQUEUE_RENDER_COMMAND(BoundHoundForceHitch)(
-					[RtSeconds](FRHICommandListImmediate&)
-					{
-						FPlatformProcess::Sleep(RtSeconds);
-					});
-			}
-
-			if (--(*Remaining) > 0)
-			{
-				return true; // keep hitching next frame
-			}
-
-			// Countdown finished -- undo the GPU cost bump and unregister the ticker.
-			if (bGpu && ScreenPctCVar)
-			{
-				ScreenPctCVar->Set(SavedScreenPercentage, ECVF_SetByConsole);
-			}
-			return false;
-		}));
-
-	// Tell the caller exactly what to expect from FrameTiming, so validation is a direct compare.
+	// Tell the caller exactly what to expect from the verdict, so validation is a direct compare.
 	const TCHAR* Expect =
 		  (Mode == TEXT("both"))   ? TEXT("contested=true (GameThread and RenderThread within margin)")
 		: (Mode == TEXT("render"))? TEXT("bound=RenderThread")
+		: (Mode == TEXT("rhi"))   ? TEXT("bound=RHIThread WHEN RHI-threading is on; otherwise the stall folds into the render thread (no distinct RHIThread verdict)")
 		: (Mode == TEXT("gpu"))   ? TEXT("bound=GPU IF the scene's GPU cost now exceeds the CPU threads (scene-dependent)")
 		:                           TEXT("bound=GameThread");
 
 	TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
 	R->SetStringField(TEXT("forcing"), Mode);
-	R->SetNumberField(TEXT("frames"), HitchFrames);
 	R->SetStringField(TEXT("expect"), Expect);
-	if (bGame || bRender)
-	{
-		R->SetNumberField(TEXT("stall_ms_per_frame"), StallMs);
-	}
+
+	// GPU forcing stays async: supersample by driving r.ScreenPercentage up, restored when the countdown
+	// ends over HitchFrames frames. It's the only scene-agnostic GPU lever we have -- the actual cost still
+	// depends on what's on screen, so a trivial PIE scene may not tip the frame GPU-bound (best-effort). GPU
+	// cost persists across the frames the reader sees, so unlike the CPU paths a follow-up FrameTiming reads
+	// it back cleanly -- which is why gpu keeps the read-a-following-frame flow instead of self-measuring.
 	if (bGpu)
 	{
+		constexpr float GpuScreenPercentage = 400.0f;
+		float SavedScreenPercentage = 100.0f;
+		IConsoleVariable* ScreenPctCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.ScreenPercentage"));
+		if (ScreenPctCVar)
+		{
+			SavedScreenPercentage = ScreenPctCVar->GetFloat();
+			ScreenPctCVar->Set(GpuScreenPercentage, ECVF_SetByConsole);
+		}
+
+		TSharedRef<int32> Remaining = MakeShared<int32>(HitchFrames);
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[Remaining, ScreenPctCVar, SavedScreenPercentage](float) -> bool
+			{
+				if (--(*Remaining) > 0)
+				{
+					return true; // keep the supersample up for the next frame
+				}
+				if (ScreenPctCVar)
+				{
+					ScreenPctCVar->Set(SavedScreenPercentage, ECVF_SetByConsole); // restore + unregister
+				}
+				return false;
+			}));
+
+		R->SetNumberField(TEXT("frames"), HitchFrames);
 		if (ScreenPctCVar)
 		{
 			R->SetNumberField(TEXT("screen_percentage"), GpuScreenPercentage);
@@ -579,12 +566,473 @@ FString UBoundHoundService::ForceHitch(const FString& Thread, float Milliseconds
 		{
 			R->SetStringField(TEXT("gpu_warning"), TEXT("r.ScreenPercentage cvar not found -- GPU load NOT applied."));
 		}
+		if (!IsPIERunning())
+		{
+			R->SetStringField(TEXT("note"), TEXT("PIE is not running -- the GPU load lands on the editor viewport frame. Start PIE for a game-representative validation."));
+		}
+		R->SetStringField(TEXT("hint"), TEXT("GPU cost is scene-dependent and not self-measured -- call FrameTiming on a following frame and confirm bound=GPU. Unlike the CPU paths this reads back cleanly (the GPU cost persists across frames)."));
+		return OkJson(R);
 	}
+
+	// CPU paths (game/render/both) -- SELF-MEASURING, so validation is race-free (issue #17). The old
+	// approach scheduled the stall on a future frame and relied on a follow-up FrameTiming to catch it, but
+	// that read runs on the game thread the stall blocks and reliably lands on a clean frame. Here we apply
+	// the stall synchronously inside this call and time it directly, then return the induced peak per-thread
+	// ms and a verdict_matched_expect flag -- the caller validates from THIS single response, no second call.
+	// Cap total synchronous blocking so a fat-fingered frames*ms can't freeze the editor for minutes.
+	constexpr double TotalCapMs = 10000.0;
+	const int32 EffectiveFrames = FMath::Min(HitchFrames, FMath::Max(1, (int32)(TotalCapMs / StallMs)));
+
+	// "rhi" self-measures only when a separate RHI thread exists to stall. With RHI-threading off the RHI
+	// work runs inline on the render thread, so there's no distinct RHIThread to bind the frame -- we skip
+	// the stall and flag it, mirroring how the verdict drops RHI from the ranking in that case (issue #2).
+	const bool bRhiThreaded = bRhi && IsRunningRHIInSeparateThread();
+
+	double PeakGameMs = 0.0;
+	double PeakRenderMs = 0.0;
+	double PeakRhiMs = 0.0;
+	for (int32 i = 0; i < EffectiveFrames; ++i)
+	{
+		if (bGame)
+		{
+			const double T0 = FPlatformTime::Seconds();
+			FPlatformProcess::Sleep(StallSeconds);
+			PeakGameMs = FMath::Max(PeakGameMs, (FPlatformTime::Seconds() - T0) * 1000.0);
+		}
+		if (bRender)
+		{
+			// Stall the render thread and have IT time its own sleep into a shared slot; FlushRenderingCommands
+			// blocks the game thread until that command completes, so the measurement is done before we read it.
+			TSharedRef<double, ESPMode::ThreadSafe> RtMs = MakeShared<double, ESPMode::ThreadSafe>(0.0);
+			const float RtSeconds = StallSeconds;
+			ENQUEUE_RENDER_COMMAND(BoundHoundForceHitch)(
+				[RtSeconds, RtMs](FRHICommandListImmediate&)
+				{
+					const double T0 = FPlatformTime::Seconds();
+					FPlatformProcess::Sleep(RtSeconds);
+					*RtMs = (FPlatformTime::Seconds() - T0) * 1000.0;
+				});
+			FlushRenderingCommands();
+			PeakRenderMs = FMath::Max(PeakRenderMs, *RtMs);
+		}
+		if (bRhiThreaded)
+		{
+			// Stall the RHI thread specifically: from the render thread, enqueue a lambda onto the command
+			// list (it executes on the RHI thread when threading is on) that times its own sleep, then flush
+			// the RHI thread so the game thread blocks until that lambda has run and the slot is filled.
+			TSharedRef<double, ESPMode::ThreadSafe> RhMs = MakeShared<double, ESPMode::ThreadSafe>(0.0);
+			const float RhSeconds = StallSeconds;
+			ENQUEUE_RENDER_COMMAND(BoundHoundForceHitchRHI)(
+				[RhSeconds, RhMs](FRHICommandListImmediate& RHICmdList)
+				{
+					RHICmdList.EnqueueLambda([RhSeconds, RhMs](FRHICommandListBase&)
+					{
+						const double T0 = FPlatformTime::Seconds();
+						FPlatformProcess::Sleep(RhSeconds);
+						*RhMs = (FPlatformTime::Seconds() - T0) * 1000.0;
+					});
+					RHICmdList.ImmediateFlush(EImmediateFlushType::FlushRHIThread);
+				});
+			FlushRenderingCommands();
+			PeakRhiMs = FMath::Max(PeakRhiMs, *RhMs);
+		}
+	}
+
+	// A thread counts as "hit" if it induced at least half the requested stall (tolerates scheduler slop).
+	const double MinExpectedMs = 0.5 * StallMs;
+	const bool bMatched = BoundHoundVerdict::HitchMatchesExpect(Mode, PeakGameMs, PeakRenderMs, MinExpectedMs, PeakRhiMs);
+
+	R->SetNumberField(TEXT("frames"), EffectiveFrames);
+	if (EffectiveFrames < HitchFrames)
+	{
+		R->SetNumberField(TEXT("frames_requested"), HitchFrames);
+		R->SetStringField(TEXT("frames_note"), FString::Printf(
+			TEXT("Capped to %d frame(s) (~%.0f ms total) so the synchronous stall can't freeze the editor."),
+			EffectiveFrames, TotalCapMs));
+	}
+	R->SetNumberField(TEXT("stall_ms_per_frame"), StallMs);
+	if (bGame)   { R->SetNumberField(TEXT("observed_peak_game_ms"), PeakGameMs); }
+	if (bRender) { R->SetNumberField(TEXT("observed_peak_render_ms"), PeakRenderMs); }
+	if (bRhi)
+	{
+		R->SetBoolField(TEXT("rhi_threading"), bRhiThreaded);
+		if (bRhiThreaded)
+		{
+			R->SetNumberField(TEXT("observed_peak_rhi_ms"), PeakRhiMs);
+		}
+		else
+		{
+			R->SetStringField(TEXT("rhi_warning"), TEXT("RHI-threading is OFF -- no separate RHI thread to stall, so no RHIThread verdict was induced. Re-run with RHI-threading on (r.RHIThread.Enable 1, or a platform where it's default) to validate the RHIThread bound."));
+		}
+	}
+	R->SetBoolField(TEXT("verdict_matched_expect"), bMatched);
 	if (!IsPIERunning())
 	{
-		R->SetStringField(TEXT("note"), TEXT("PIE is not running -- the hitch lands on the editor viewport frame. Start PIE for a game-representative validation."));
+		R->SetStringField(TEXT("note"), TEXT("PIE is not running -- the stall was still induced and measured directly on the editor frame, so verdict_matched_expect is valid. Start PIE for a game-representative FrameTiming reading."));
 	}
-	R->SetStringField(TEXT("hint"), TEXT("Now call FrameTiming (on a following frame) and confirm the reading matches 'expect'. Thread times reflect the last COMPLETED frame, so read at least one frame after this call."));
+	R->SetStringField(TEXT("hint"), TEXT("Validation is self-contained: 'verdict_matched_expect' compares the stall this call actually induced ('observed_peak_*_ms') against 'expect' -- no follow-up FrameTiming needed (that read races the stall on the game thread and misses it)."));
+	return OkJson(R);
+}
+
+// ---------------------------------------------------------------------------
+// Report -- render a self-contained HTML "printout" from the verdict + capture
+// ---------------------------------------------------------------------------
+
+// Verified UE 5.8 documentation URLs, linked per fix so the report tells you where to go next.
+namespace BoundHoundDocs
+{
+	static const TCHAR* PsoPrecache = TEXT("https://dev.epicgames.com/documentation/en-us/unreal-engine/pso-precaching-for-unreal-engine");
+	static const TCHAR* PsoCaches   = TEXT("https://dev.epicgames.com/documentation/en-us/unreal-engine/optimizing-rendering-with-pso-caches-in-unreal-engine");
+	static const TCHAR* Profiling   = TEXT("https://dev.epicgames.com/documentation/en-us/unreal-engine/introduction-to-performance-profiling-and-configuration-in-unreal-engine");
+	static const TCHAR* StatCommands= TEXT("https://dev.epicgames.com/documentation/en-us/unreal-engine/stat-commands-in-unreal-engine");
+	static const TCHAR* Insights    = TEXT("https://dev.epicgames.com/documentation/en-us/unreal-engine/unreal-insights-in-unreal-engine");
+}
+
+// Escape text destined for HTML body/attributes (paths, log lines, verdict strings).
+static FString BHHtmlEscape(const FString& In)
+{
+	FString Out = In;
+	Out.ReplaceInline(TEXT("&"), TEXT("&amp;"));
+	Out.ReplaceInline(TEXT("<"), TEXT("&lt;"));
+	Out.ReplaceInline(TEXT(">"), TEXT("&gt;"));
+	Out.ReplaceInline(TEXT("\""), TEXT("&quot;"));
+	return Out;
+}
+
+// One recommended fix, rendered as a numbered card: what/why + the exact commands + a doc link.
+struct FBHFix
+{
+	FString Title;
+	FString Why;
+	FString How;      // concrete stat/console commands -- shown in a mono block
+	FString DocUrl;
+	FString DocLabel;
+};
+
+// The report's stylesheet -- inlined so the file is fully self-contained and opens anywhere. Same visual
+// identity as the shareable comparison page: mono headings, teal "trace" accent, semantic good/warn/crit,
+// and both light + dark themes driven by tokens.
+static const TCHAR* BHReportCss = TEXT(R"CSS(<style>
+:root{--bg:#eef2f1;--surface:#fff;--surface-2:#f6f9f8;--ink:#13201e;--muted:#586b68;--border:#dde5e3;--border-strong:#c7d2d0;--accent:#0c9a8b;--accent-ink:#0a7c70;--good:#1c8f52;--good-bg:#1c8f5216;--warn:#b1780a;--warn-bg:#b1780a18;--crit:#cc453b;--crit-bg:#cc453b16;--mono:"SFMono-Regular","Cascadia Code","JetBrains Mono","Fira Code",Menlo,Consolas,monospace;--sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+@media(prefers-color-scheme:dark){:root{--bg:#0c1312;--surface:#111b1a;--surface-2:#0f1817;--ink:#e7f0ee;--muted:#93a6a3;--border:#22302e;--border-strong:#2d3d3a;--accent:#3ad6c6;--accent-ink:#5ee0d2;--good:#45c07e;--good-bg:#45c07e1f;--warn:#e0a53c;--warn-bg:#e0a53c22;--crit:#ec6f63;--crit-bg:#ec6f6320}}
+*{box-sizing:border-box}
+body{margin:0}
+.wrap{background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.5;padding:clamp(20px,4vw,52px);-webkit-font-smoothing:antialiased}
+.sheet{max-width:960px;margin:0 auto}
+.eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:var(--accent-ink);display:flex;align-items:center;gap:10px;margin:0 0 14px}
+.eyebrow::before{content:"";width:26px;height:2px;background:var(--accent);display:inline-block}
+h1{font-family:var(--mono);font-weight:650;font-size:clamp(24px,4vw,36px);letter-spacing:-.01em;line-height:1.1;margin:0 0 10px}
+.lede{font-size:15px;color:var(--muted);max-width:64ch;margin:0 0 30px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin:0 0 30px}
+.tile{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 18px;position:relative;overflow:hidden}
+.tile::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--tc,var(--accent))}
+.tile.good{--tc:var(--good)}.tile.warn{--tc:var(--warn)}.tile.crit{--tc:var(--crit)}
+.tile .k{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:0 0 8px}
+.tile .v{font-family:var(--mono);font-size:clamp(22px,3vw,29px);font-weight:650;line-height:1;font-variant-numeric:tabular-nums}
+.tile .v small{font-size:14px;font-weight:500;color:var(--muted);margin-left:3px}
+.tile .s{font-size:12.5px;color:var(--muted);margin:8px 0 0}
+thead th.rec{color:var(--accent-ink)}
+tbody td{vertical-align:top}
+.dim{font-weight:600;color:var(--ink);white-space:nowrap}
+.dim small{display:block;font-weight:400;font-family:var(--mono);font-size:10.5px;letter-spacing:.04em;color:var(--muted);margin-top:3px;text-transform:uppercase}
+td.warm,td.cold{color:var(--muted)}
+td.warm b,td.cold b{color:var(--ink);font-family:var(--mono);font-variant-numeric:tabular-nums;font-weight:600}
+td.rec-cell{color:var(--ink);border-left:1px solid var(--border)}
+td.rec-cell code,td.warm code,td.cold code{font-family:var(--mono);font-size:12px;background:var(--surface-2);border:1px solid var(--border);padding:1px 5px;border-radius:4px}
+.tag{display:inline-block;font-family:var(--mono);font-size:11px;font-weight:600;letter-spacing:.03em;padding:2px 7px;border-radius:5px;white-space:nowrap}
+.tag.hidden{color:var(--crit);background:var(--crit-bg)}
+.tag.caught{color:var(--good);background:var(--good-bg)}
+.tag.warn{color:var(--warn);background:var(--warn-bg)}
+h2{font-family:var(--mono);font-size:13px;letter-spacing:.1em;text-transform:uppercase;color:var(--accent-ink);margin:34px 0 14px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+.table-scroll{overflow-x:auto}
+table{border-collapse:collapse;width:100%;min-width:520px;font-size:14px}
+thead th{text-align:left;font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:600;padding:12px 16px;background:var(--surface-2);border-bottom:1px solid var(--border-strong);white-space:nowrap}
+tbody td{padding:11px 16px;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums}
+tbody tr:last-child td{border-bottom:none}
+tbody tr.bound td{background:var(--accent-wash,transparent)}
+.th-name{font-family:var(--mono);font-weight:600}
+.num{font-family:var(--mono)}
+.pill{display:inline-block;font-family:var(--mono);font-size:11px;font-weight:600;padding:2px 8px;border-radius:20px;white-space:nowrap}
+.pill.good{color:var(--good);background:var(--good-bg)}.pill.warn{color:var(--warn);background:var(--warn-bg)}.pill.crit{color:var(--crit);background:var(--crit-bg)}
+.fixes{display:flex;flex-direction:column;gap:14px;counter-reset:fx}
+.fix{counter-increment:fx;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px 20px;display:grid;grid-template-columns:auto 1fr;gap:16px}
+.fix::before{content:counter(fx);font-family:var(--mono);font-weight:650;font-size:15px;color:var(--accent);width:30px;height:30px;display:grid;place-items:center;border:1px solid var(--border-strong);border-radius:8px;align-self:start}
+.fix .ft{font-weight:600;margin:0 0 4px}
+.fix .fw{color:var(--muted);font-size:13.5px;margin:0 0 12px}
+.fix .how-l{font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--accent-ink);margin:0 0 6px}
+.fix pre{font-family:var(--mono);font-size:12.5px;background:var(--surface-2);border:1px solid var(--border);border-radius:7px;padding:10px 12px;margin:0 0 12px;overflow-x:auto;color:var(--ink);white-space:pre-wrap}
+.fix a.doc{font-size:13px;color:var(--accent-ink);text-decoration:none;font-weight:600;border-bottom:1px solid var(--accent)}
+.fix a.doc:hover{opacity:.8}
+.guide{margin:20px 0 0;padding:16px 20px;border:1px dashed var(--border-strong);border-radius:12px;font-size:13.5px;color:var(--muted)}
+.guide b{color:var(--ink)}
+.worst{list-style:none;margin:0;padding:0;font-family:var(--mono);font-size:13px}
+.worst li{display:flex;justify-content:space-between;gap:14px;padding:8px 16px;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums}
+.worst li:last-child{border-bottom:none}
+.worst .fm{color:var(--muted)}
+footer{margin:28px 2px 0;font-family:var(--mono);font-size:11px;letter-spacing:.03em;color:var(--muted);display:flex;flex-wrap:wrap;gap:6px 18px}
+footer b{color:var(--ink);font-weight:600}
+a:focus-visible,.doc:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+</style>)CSS");
+
+FString UBoundHoundService::Report(const FString& Title, const FString& Source, const FString& File)
+{
+	auto Deserialize = [](const FString& Json) -> TSharedPtr<FJsonObject>
+	{
+		TSharedPtr<FJsonObject> Obj;
+		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Json);
+		FJsonSerializer::Deserialize(Reader, Obj);
+		return Obj;
+	};
+	auto Num = [](const TSharedPtr<FJsonObject>& O, const TCHAR* K, double D = 0.0) -> double
+	{ double V = D; if (O.IsValid()) { O->TryGetNumberField(K, V); } return V; };
+	auto Str = [](const TSharedPtr<FJsonObject>& O, const TCHAR* K) -> FString
+	{ FString V; if (O.IsValid()) { O->TryGetStringField(K, V); } return V; };
+
+	// --- Gather: live verdict + budget, and the capture summary (best-effort) --------------------------
+	const TSharedPtr<FJsonObject> FT = Deserialize(FrameTiming(60.0f));
+	if (!FT.IsValid())
+	{
+		return ErrJson(TEXT("REPORT_NO_TIMING"), TEXT("FrameTiming returned no parseable data to report on."));
+	}
+	const TSharedPtr<FJsonObject>* BudgetPtr = nullptr;
+	FT->TryGetObjectField(TEXT("budget"), BudgetPtr);
+	const TSharedPtr<FJsonObject> Budget = BudgetPtr ? *BudgetPtr : nullptr;
+
+	const TSharedPtr<FJsonObject> AN = Deserialize(Analyse(Source, File));
+	const TSharedPtr<FJsonObject>* TracePtr = nullptr;
+	const TSharedPtr<FJsonObject>* LogsPtr  = nullptr;
+	if (AN.IsValid()) { AN->TryGetObjectField(TEXT("trace"), TracePtr); AN->TryGetObjectField(TEXT("logs"), LogsPtr); }
+	const TSharedPtr<FJsonObject> Trace = TracePtr ? *TracePtr : nullptr;
+	const TSharedPtr<FJsonObject> Logs  = LogsPtr  ? *LogsPtr  : nullptr;
+
+	const double GameMs   = Num(FT, TEXT("game_thread_ms"));
+	const double RenderMs = Num(FT, TEXT("render_thread_ms"));
+	const double RhiMs    = Num(FT, TEXT("rhi_thread_ms"));
+	const double GpuMs    = Num(FT, TEXT("gpu_ms"));
+	const double FrameMs  = Num(FT, TEXT("frame_ms"));
+	const double Fps      = Num(FT, TEXT("fps"));
+	const FString Bound   = Str(FT, TEXT("bound"));
+	const FString Conf    = Str(FT, TEXT("bound_confidence"));
+	const double BudgetMs = Num(Budget, TEXT("budget_ms"), 16.67);
+	const double TargetFps= Num(Budget, TEXT("target_fps"), 60.0);
+	const bool bMeets     = Budget.IsValid() && Budget->GetBoolField(TEXT("meets_target"));
+	const bool bPIE       = FT->GetBoolField(TEXT("pie_running"));
+
+	const bool bHasTrace = Trace.IsValid() && Num(Trace, TEXT("frame_count")) > 0.0;
+	const double MaxFrameMs = Num(Trace, TEXT("max_frame_ms"));
+	const double P95Ms      = Num(Trace, TEXT("p95_frame_ms"));
+	const int32  FrameCount = (int32)Num(Trace, TEXT("frame_count"));
+	const double AvgFps     = Num(Trace, TEXT("avg_fps"));
+	const double DurationS  = Num(Trace, TEXT("duration_seconds"));
+	const bool bHasLogs  = Logs.IsValid();
+	const int32 PsoHitches = (int32)Num(Logs, TEXT("pso_hitches"));
+	const int32 LogErrors  = (int32)Num(Logs, TEXT("errors"));
+	const int32 LogWarnings= (int32)Num(Logs, TEXT("warnings"));
+
+	// --- Build the "fix in this order" list from the data ---------------------------------------------
+	TArray<FBHFix> Fixes;
+	if (bHasTrace && MaxFrameMs > 250.0)
+	{
+		Fixes.Add({
+			FString::Printf(TEXT("Startup / load hitch — %s ms peak frame"), *FString::FormatAsNumber((int64)MaxFrameMs)),
+			TEXT("A representative (cold-cache) run pays load, PSO and shader-compilation costs the editor's warm caches hide. This is almost always the single biggest stall a player feels."),
+			TEXT("# Ship a bundled PSO cache + keep precaching on (default):\nr.PSOPrecache.GlobalShaders 1\n# Then async-stream the opening level so the first frame isn't a hard stall."),
+			BoundHoundDocs::PsoPrecache, TEXT("PSO Precaching — UE 5.8 docs") });
+	}
+	if (Bound == TEXT("GameThread"))
+	{
+		Fixes.Add({ TEXT("Game-thread bound — CPU logic cost"),
+			TEXT("Tick / Blueprint / AI / animation dominate the frame. Dropping resolution or GPU cost will not help a game-thread-bound frame."),
+			TEXT("stat dumpframe -ms=0.5 -root=gamethread\n# or capture with Unreal Insights, then cut the worst scopes:\n# throttle Tick, reduce ticking actors & AI, trim Blueprint tick logic."),
+			BoundHoundDocs::StatCommands, TEXT("Stat Commands — UE 5.8 docs") });
+	}
+	else if (Bound == TEXT("RenderThread"))
+	{
+		Fixes.Add({ TEXT("Render-thread bound — scene setup cost"),
+			TEXT("Too many draw calls / primitives, or many dynamic shadow-casting lights, saturate render-thread scene setup."),
+			TEXT("stat scenerendering\n# Levers: merge/instance meshes, enable Nanite, cut dynamic lights & per-light shadows."),
+			BoundHoundDocs::Profiling, TEXT("Performance Profiling — UE 5.8 docs") });
+	}
+	else if (Bound == TEXT("RHIThread"))
+	{
+		Fixes.Add({ TEXT("RHI-thread bound — GPU command submission"),
+			TEXT("The thread submitting GPU commands is the bottleneck, distinct from render-thread scene setup — usually too many draw calls / state changes."),
+			TEXT("stat rhi\nstat scenerendering\n# Levers: cut draw calls via merging / instancing / HISM, enable Nanite, reduce material & state permutations."),
+			BoundHoundDocs::Profiling, TEXT("Performance Profiling — UE 5.8 docs") });
+	}
+	else if (Bound == TEXT("GPU"))
+	{
+		Fixes.Add({ TEXT("GPU bound — render cost"),
+			TEXT("The GPU is the bottleneck. Confirm with the resolution test: r.ScreenPercentage 50 should noticeably raise FPS if truly GPU-bound."),
+			TEXT("ProfileGPU\n# Levers: Virtual Shadow Maps, Lumen GI/reflections, translucency, post-process, ScreenPercentage."),
+			BoundHoundDocs::Insights, TEXT("Unreal Insights — UE 5.8 docs") });
+	}
+	if (bHasLogs && PsoHitches > 0)
+	{
+		Fixes.Add({ FString::Printf(TEXT("%d PSO hitch%s — pipeline-state cache misses"), PsoHitches, PsoHitches == 1 ? TEXT("") : TEXT("es")),
+			TEXT("A PSO stalls the first time a shader/state combo is drawn. Gathering a bundled cache from a representative playthrough removes them."),
+			TEXT("# Enable PSO logging in a build, play a representative pass, then bundle the cache:\nr.ShaderPipelineCache.Enabled 1\nr.PSOPrecache.Components 1"),
+			BoundHoundDocs::PsoCaches, TEXT("Optimizing Rendering with PSO Caches — UE 5.8 docs") });
+	}
+
+	// --- Compose the HTML -----------------------------------------------------------------------------
+	auto ConfClass = [](const FString& C) -> const TCHAR*
+	{ return C == TEXT("clear") ? TEXT("good") : (C == TEXT("none") ? TEXT("crit") : TEXT("warn")); };
+
+	FString H;
+	H.Reserve(16 * 1024);
+	H += FString::Printf(TEXT("<title>%s</title>"), *BHHtmlEscape(Title));
+	H += BHReportCss;
+	H += TEXT("<div class=\"wrap\"><div class=\"sheet\">");
+	H += FString::Printf(TEXT("<p class=\"eyebrow\">BoundHound &middot; %s &middot; %s</p>"),
+		*BHHtmlEscape(FApp::GetProjectName()), bPIE ? TEXT("PIE frame") : TEXT("Editor frame"));
+	H += FString::Printf(TEXT("<h1>%s</h1>"), *BHHtmlEscape(Title));
+	H += FString::Printf(TEXT("<p class=\"lede\">Frame verdict and, where a capture is available, the representative frame stats — with a data-driven fix order. Generated %s.</p>"),
+		*BHHtmlEscape(FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M"))));
+
+	// Headline tiles: with a representative capture, frame them as the in-process-vs-representative contrast
+	// (warm reading vs the cold worst frame + p95); without one, fall back to the single-run KPIs.
+	H += TEXT("<div class=\"tiles\">");
+	if (bHasTrace)
+	{
+		const double Ratio = FrameMs > 0.0 ? (P95Ms / FrameMs) : 0.0;
+		H += FString::Printf(TEXT("<div class=\"tile warn\"><p class=\"k\">In-process (warm)</p><p class=\"v\">%.1f<small>ms</small></p><p class=\"s\">%.0f fps &middot; %s &middot; budget %s</p></div>"),
+			FrameMs, Fps, *BHHtmlEscape(Bound.IsEmpty() ? TEXT("—") : Bound), bMeets ? TEXT("PASS") : TEXT("FAIL"));
+		H += FString::Printf(TEXT("<div class=\"tile crit\"><p class=\"k\">Worst frame (cold)</p><p class=\"v\">%s<small>ms</small></p><p class=\"s\">The frame-0 stall the warm reading hid.</p></div>"),
+			*FString::FormatAsNumber((int64)MaxFrameMs));
+		H += FString::Printf(TEXT("<div class=\"tile %s\"><p class=\"k\">Steady-state (p95)</p><p class=\"v\">%.0f<small>ms</small></p><p class=\"s\">~%.0f&times; the %.1f ms in-process frame.</p></div>"),
+			P95Ms > BudgetMs ? TEXT("crit") : TEXT("good"), P95Ms, Ratio, FrameMs);
+	}
+	else
+	{
+		H += FString::Printf(TEXT("<div class=\"tile %s\"><p class=\"k\">Frame</p><p class=\"v\">%.1f<small>ms</small></p><p class=\"s\">%.0f fps live</p></div>"),
+			FrameMs > BudgetMs ? TEXT("crit") : TEXT("good"), FrameMs, Fps);
+		H += FString::Printf(TEXT("<div class=\"tile %s\"><p class=\"k\">Bound</p><p class=\"v\" style=\"font-size:22px\">%s</p><p class=\"s\">%s confidence</p></div>"),
+			ConfClass(Conf), *BHHtmlEscape(Bound.IsEmpty() ? TEXT("—") : Bound), *BHHtmlEscape(Conf));
+		H += FString::Printf(TEXT("<div class=\"tile %s\"><p class=\"k\">Budget @ %.0f fps</p><p class=\"v\" style=\"font-size:22px\">%s</p><p class=\"s\">%.2f ms/frame budget</p></div>"),
+			bMeets ? TEXT("good") : TEXT("crit"), TargetFps, bMeets ? TEXT("PASS") : TEXT("FAIL"), BudgetMs);
+	}
+	H += TEXT("</div>");
+
+	// The full in-process vs representative matrix -- only when a capture supplies the cold column. Numbers
+	// are live; the descriptive cells are the fixed teaching layer (the nature of warm-vs-cold doesn't change
+	// run to run). This is the "juice" -- artifact-1's comparison, auto-filled from this run's data.
+	if (bHasTrace)
+	{
+		const TCHAR* SteadyRec =
+			  Bound == TEXT("GameThread")   ? TEXT("Frame is <b>game-thread bound</b> &rarr; drill <code>stat dumpframe -root=gamethread</code> (Tick / BP / AI / anim)")
+			: Bound == TEXT("RenderThread") ? TEXT("Frame is <b>render-thread bound</b> &rarr; <code>stat scenerendering</code>; merge/instance meshes, cut dynamic lights")
+			: Bound == TEXT("RHIThread")    ? TEXT("Frame is <b>RHI-thread bound</b> &rarr; <code>stat rhi</code>; cut draw calls via instancing / HISM / Nanite")
+			: Bound == TEXT("GPU")          ? TEXT("Frame is <b>GPU bound</b> &rarr; <code>ProfileGPU</code>; shadows, Lumen, translucency, ScreenPercentage")
+			:                                 TEXT("Profile the bottleneck thread with Unreal Insights");
+
+		H += TEXT("<h2>In-process vs Representative</h2><div class=\"card table-scroll\"><table style=\"min-width:720px\">");
+		H += TEXT("<thead><tr><th>Dimension</th><th>In-process — warm</th><th>Representative — cold</th><th class=\"rec\">Where to improve</th></tr></thead><tbody>");
+		H += TEXT("<tr><td class=\"dim\">Process &amp; caches<small>environment</small></td><td class=\"warm\">Editor/PIE process, <b>warm</b> shader/PSO caches, on-demand cooked data</td><td class=\"cold\">Separate process, <b>cold</b> caches — like a shipping build</td><td class=\"rec-cell\">Trust the representative numbers for anything absolute; in-process is for logic checks</td></tr>");
+		H += FString::Printf(TEXT("<tr><td class=\"dim\">Startup hitch<small>the fixture</small></td><td class=\"warm\"><span class=\"tag hidden\">invisible</span></td><td class=\"cold\"><b>%s ms</b> @ frame 0 <span class=\"tag caught\">caught</span></td><td class=\"rec-cell\"><b>Biggest lever.</b> Load / PSO / shader-comp bound at boot — ship a PSO precache, warm the shader pipeline, async-stream the first level</td></tr>"),
+			*FString::FormatAsNumber((int64)MaxFrameMs));
+		H += FString::Printf(TEXT("<tr><td class=\"dim\">PSO hitches<small>pipeline stalls</small></td><td class=\"warm\">Not surfaced</td><td class=\"cold\"><b>%d</b> from <code>-logPSO</code>%s</td><td class=\"rec-cell\">Bundle a gathered PSO cache with the build — folds into the startup fix</td></tr>"),
+			PsoHitches, PsoHitches > 0 ? TEXT(" <span class=\"tag warn\">hitch</span>") : TEXT(""));
+		H += FString::Printf(TEXT("<tr class=\"bound\"><td class=\"dim\">Steady-state frame<small>hot path</small></td><td class=\"warm\"><b>%.1f ms</b> &middot; %s &middot; %.0f fps</td><td class=\"cold\"><b>p95 %.0f ms</b> &middot; avg <b>%.1f fps</b> &middot; %d frames</td><td class=\"rec-cell\">%s</td></tr>"),
+			FrameMs, *BHHtmlEscape(Bound.IsEmpty() ? TEXT("—") : Bound), Fps, P95Ms, AvgFps, FrameCount, SteadyRec);
+		H += FString::Printf(TEXT("<tr><td class=\"dim\">Render thread<small>attribution</small></td><td class=\"warm\">Reads <b>%.1f ms</b> in-process</td><td class=\"cold\">Captured per-frame in the trace</td><td class=\"rec-cell\">Use a representative trace for render / RHI attribution — in-process render time is not shipping-accurate</td></tr>"),
+			RenderMs);
+		H += TEXT("<tr><td class=\"dim\">Bound verdict<small>CPU vs GPU</small></td><td class=\"warm\">Live — <code>FrameTiming</code> / <code>ForceHitch</code> self-measure</td><td class=\"cold\">Read via trace + <code>Analyse</code></td><td class=\"rec-cell\">In-process for the fast verdict + hitch self-validation; representative for <i>where</i> the ms goes</td></tr>");
+		H += TEXT("<tr><td class=\"dim\">Best use<small>role</small></td><td class=\"warm\">Quick sanity + verdict/hitch <b>logic</b> checks</td><td class=\"cold\"><b>Real stall identification</b> &amp; regression capture</td><td class=\"rec-cell\">Keep both — they answer different questions</td></tr>");
+		H += TEXT("</tbody></table></div>");
+	}
+
+	// Per-thread table
+	H += TEXT("<h2>Thread breakdown &middot; in-process frame</h2><div class=\"card table-scroll\"><table><thead><tr><th>Thread</th><th>ms</th><th>vs budget</th></tr></thead><tbody>");
+	struct FRow { const TCHAR* Name; double Ms; bool bShow; };
+	const FRow Rows[] = {
+		{ TEXT("Game"),   GameMs,   true },
+		{ TEXT("Render"), RenderMs, true },
+		{ TEXT("RHI"),    RhiMs,    RhiMs > 0.0 },
+		{ TEXT("GPU"),    GpuMs,    GpuMs > 0.0 },
+	};
+	for (const FRow& Rw : Rows)
+	{
+		if (!Rw.bShow) continue;
+		const bool bOver = Rw.Ms > BudgetMs;
+		const bool bIsBound = Bound.StartsWith(Rw.Name);
+		H += FString::Printf(TEXT("<tr%s><td class=\"th-name\">%s%s</td><td class=\"num\">%.2f</td><td>%s</td></tr>"),
+			bIsBound ? TEXT(" class=\"bound\"") : TEXT(""),
+			Rw.Name, bIsBound ? TEXT(" ◀") : TEXT(""),
+			Rw.Ms,
+			bOver ? TEXT("<span class=\"pill crit\">over</span>") : TEXT("<span class=\"pill good\">ok</span>"));
+	}
+	H += TEXT("</tbody></table></div>");
+
+	// Capture summary (trace worst frames + log health), when present
+	if (bHasTrace)
+	{
+		H += FString::Printf(TEXT("<h2>Representative capture &middot; %.0fs &middot; avg %.1f fps</h2>"), DurationS, AvgFps);
+		const TArray<TSharedPtr<FJsonValue>>* Worst = nullptr;
+		if (Trace->TryGetArrayField(TEXT("worst_frames"), Worst) && Worst)
+		{
+			H += TEXT("<div class=\"card\"><ul class=\"worst\">");
+			int32 Shown = 0;
+			for (const TSharedPtr<FJsonValue>& V : *Worst)
+			{
+				const TSharedPtr<FJsonObject> WO = V->AsObject();
+				if (!WO.IsValid()) continue;
+				H += FString::Printf(TEXT("<li><span class=\"fm\">frame %d</span><span>%s ms</span></li>"),
+					(int32)WO->GetNumberField(TEXT("frame")), *FString::FormatAsNumber((int64)WO->GetNumberField(TEXT("ms"))));
+				if (++Shown >= 6) break;
+			}
+			H += TEXT("</ul></div>");
+		}
+		if (bHasLogs)
+		{
+			H += FString::Printf(TEXT("<p class=\"lede\" style=\"margin-top:14px\">Log: %s errors, %s warnings, <b style=\"color:var(--ink)\">%d PSO hitch%s</b>.</p>"),
+				*FString::FormatAsNumber(LogErrors), *FString::FormatAsNumber(LogWarnings), PsoHitches, PsoHitches == 1 ? TEXT("") : TEXT("es"));
+		}
+	}
+	else
+	{
+		H += TEXT("<p class=\"lede\" style=\"margin-top:8px\">No capture analysed — run <b>StartStandalone</b> (or StartTrace → workload → StopTrace), then Report again for frame-level worst-case detail.</p>");
+	}
+
+	// Fix list
+	if (Fixes.Num() > 0)
+	{
+		H += TEXT("<h2>Fix in this order</h2><div class=\"fixes\">");
+		for (const FBHFix& Fx : Fixes)
+		{
+			H += TEXT("<div class=\"fix\"><div>");
+			H += FString::Printf(TEXT("<p class=\"ft\">%s</p><p class=\"fw\">%s</p>"), *BHHtmlEscape(Fx.Title), *BHHtmlEscape(Fx.Why));
+			H += FString::Printf(TEXT("<p class=\"how-l\">How to fix</p><pre>%s</pre>"), *BHHtmlEscape(Fx.How));
+			H += FString::Printf(TEXT("<a class=\"doc\" href=\"%s\">%s &rarr;</a>"), *Fx.DocUrl, *BHHtmlEscape(Fx.DocLabel));
+			H += TEXT("</div></div>");
+		}
+		H += TEXT("</div>");
+		H += TEXT("<div class=\"guide\"><b>Want a walkthrough?</b> Ask your assistant to guide you through any fix above — it can run the commands, read the results back, and validate the change with ForceHitch.</div>");
+	}
+
+	H += FString::Printf(TEXT("<footer><span><b>Project:</b> %s</span>"), *BHHtmlEscape(FApp::GetProjectName()));
+	if (bHasTrace) { H += FString::Printf(TEXT("<span><b>Capture:</b> %d frames / %.0fs</span>"), FrameCount, DurationS); }
+	H += FString::Printf(TEXT("<span><b>Generated:</b> %s</span><span><b>Tool:</b> BoundHound FrameTiming + Analyse</span></footer>"),
+		*BHHtmlEscape(FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M:%S"))));
+	H += TEXT("</div></div>");
+
+	// --- Write the self-contained file ----------------------------------------------------------------
+	const FString Dir = ProjectSavedDirAbs() / TEXT("BoundHound");
+	IPlatformFile::GetPlatformPhysical().CreateDirectoryTree(*Dir);
+	const FString Path = Dir / FString::Printf(TEXT("report_%s.html"), *FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S")));
+	if (!FFileHelper::SaveStringToFile(H, *Path, FFileHelper::EEncodingOptions::ForceUTF8))
+	{
+		return ErrJson(TEXT("REPORT_WRITE_FAILED"), FString::Printf(TEXT("Could not write report to %s"), *Path));
+	}
+
+	TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("report_file"), Path);
+	R->SetNumberField(TEXT("fix_count"), Fixes.Num());
+	R->SetBoolField(TEXT("included_capture"), bHasTrace);
+	R->SetStringField(TEXT("bound"), Bound);
+	R->SetStringField(TEXT("hint"), FString::Printf(
+		TEXT("Self-contained HTML written. Open it in any browser or screenshot it to share: %s"), *Path));
 	return OkJson(R);
 }
 

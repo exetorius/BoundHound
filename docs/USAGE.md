@@ -7,7 +7,7 @@ from Python with no C++ required. Run everything here from the editor's Python c
 | Method | Purpose |
 |--------|---------|
 | `frame_timing(target_fps=60)` | Game/Render/GPU/RHI thread ms + a robust CPU-vs-GPU `bound` verdict, a `hint`, and a per-thread `budget` pass/fail gate against `target_fps`. **Run FIRST.** |
-| `force_hitch(thread="game", milliseconds=250, frames=1)` | **Test/validation helper.** Deliberately induce a hitch on a known thread, then confirm `frame_timing` reads it back correctly. See [Validating the verdict](#-validating-the-verdict-force_hitch). |
+| `force_hitch(thread="game", milliseconds=250, frames=1)` | **Test/validation helper.** Deliberately induce a hitch on a known thread (`game`/`render`/`both`/`rhi`/`gpu`). CPU + RHI paths self-validate in one call (`observed_peak_*_ms` + `verdict_matched_expect`); `gpu` reads back via `frame_timing`. See [Validating the verdict](#-validating-the-verdict-force_hitch). |
 | `start_trace(name="mcp_capture", channels="")` | Start an Insights trace to file (default channel set if `channels` empty). |
 | `stop_trace()` | Stop the active trace; returns the trace file path + size. |
 | `get_trace_status()` | Whether a trace is active and which channels are enabled. |
@@ -17,6 +17,7 @@ from Python with no C++ required. Run everything here from the editor's Python c
 | `start_standalone(name, channels)` | Launch the game as a separate standalone process with a trace attached. Writes its own **timestamped log** (`<name>_<YYYYMMDD_HHMMSS>.log`) via `-abslog`, so `analyse("logs")` reads the standalone's log, not the editor's locked one. |
 | `stop_standalone()` / `get_standalone_status()` | Control / inspect the standalone capture. |
 | `start_pie()` / `stop_pie()` | Start/stop **in-process** Play-In-Editor (opens a PIE window in the editor process). Makes `frame_timing`/`force_hitch` read a live game world. See [PIE vs Standalone](#-pie-vs-standalone). |
+| `report(title, source="both", file="")` | Render a **self-contained HTML report** from the live verdict/budget + the most recent capture (frame stats, worst frames, PSO hitches) with a data-driven "fix in this order" list, to `Saved/BoundHound/report_<ts>.html`. See [The HTML report](#-the-html-report-report). |
 
 All methods return a JSON string. For a representative reading, profile under PIE or a standalone
 session, not the bare editor viewport.
@@ -24,7 +25,7 @@ session, not the bare editor viewport.
 ## 🚦 STEP 0 — Is it CPU-bound or GPU-bound? (DO THIS FIRST, ALWAYS)
 
 **Never optimise before you know which processor is the bottleneck.** Frame time is roughly
-`max(GameThread, RenderThread, GPU)` — these run in parallel, so only the *longest* one sets your FPS.
+`max(GameThread, RenderThread, RHIThread, GPU)` — these run in parallel, so only the *longest* one sets your FPS.
 Cutting GPU cost (shadows, Lumen, post-process) does **nothing** if the frame is game- or
 render-thread bound, and vice-versa.
 
@@ -36,7 +37,7 @@ print(result)  # ...thread_ms, frame_ms, bound, bound_confidence, contested, hin
 ```
 
 Start PIE first and park in a representative/worst spot, then call it. It returns the per-thread ms,
-a `bound` verdict (`GameThread` / `RenderThread` / `GPU`), and a `hint` with what to do next — the
+a `bound` verdict (`GameThread` / `RenderThread` / `RHIThread` / `GPU`), and a `hint` with what to do next — the
 same data the `stat unit` overlay shows, read straight from engine globals.
 
 ### The verdict is deliberately cautious
@@ -81,38 +82,48 @@ exactly which one blew the budget.
 
 ## 🧪 Validating the verdict (`force_hitch`)
 
-`force_hitch` is a **test instrument**: it deliberately stalls a known thread so you can confirm
-`frame_timing` names the right bottleneck. Fire it, then read `frame_timing` on a following frame and
-check the reading matches — that's your regression check for the verdict logic itself.
+`force_hitch` is a **test instrument**: it deliberately stalls a known thread so you can confirm the
+verdict logic fires against a known ground truth. The CPU paths (`game`/`render`/`both`) are
+**self-validating** — the stall is applied synchronously and timed inside the call, so a *single*
+response tells you whether it landed. No follow-up `frame_timing` (see the race note below).
 
 ```python
 import unreal, json
-# Force a 250 ms game-thread hitch, then confirm the verdict:
-print(json.loads(unreal.BoundHoundService.force_hitch("game", 250)))   # -> {"expect": "bound=GameThread", ...}
-print(json.loads(unreal.BoundHoundService.frame_timing()))             # bound should read "GameThread"
+# Force a 250 ms game-thread hitch and read the result from the SAME call:
+r = json.loads(unreal.BoundHoundService.force_hitch("game", 250))
+# -> {"expect": "bound=GameThread", "observed_peak_game_ms": ~250, "verdict_matched_expect": true, ...}
+assert r["verdict_matched_expect"]
 ```
 
-The validation matrix — force each, expect the paired verdict:
+The validation matrix — force each, expect the paired result:
 
-| `thread` | What it stalls | Expect from `frame_timing` |
-|----------|----------------|-----------------------------|
-| `game`   | Game thread, `milliseconds`/frame | `bound: "GameThread"` |
-| `render` | Render thread, `milliseconds`/frame | `bound: "RenderThread"` |
-| `both`   | Game **and** render, equal size | `contested: true`, `contested_with` set |
-| `gpu`    | Supersamples via `r.ScreenPercentage` (auto-restored) | `bound: "GPU"` *if the scene's GPU cost tips past CPU — scene-dependent* |
+| `thread` | What it stalls | Self-validates via | Expect |
+|----------|----------------|--------------------|--------|
+| `game`   | Game thread, `milliseconds`/frame | `observed_peak_game_ms` + `verdict_matched_expect` | game peak ≥ ½ stall & dominates → `true` |
+| `render` | Render thread, `milliseconds`/frame | `observed_peak_render_ms` + `verdict_matched_expect` | render peak ≥ ½ stall & dominates → `true` |
+| `both`   | Game **and** render, equal size | both peaks + `verdict_matched_expect` | both peaks ≥ ½ stall → `true` |
+| `rhi`    | RHI thread (render thread enqueues a self-timing lambda + flushes the RHI thread) | `observed_peak_rhi_ms` + `verdict_matched_expect` | rhi peak ≥ ½ stall & dominates both CPU threads → `true` — **only when RHI-threading is on** |
+| `gpu`    | Supersamples via `r.ScreenPercentage` (auto-restored) | *follow-up* `frame_timing` | `bound: "GPU"` *if scene GPU cost tips past CPU — scene-dependent* |
 
 Notes:
-- **`force_hitch`'s CPU stalls need a live game world.** The game/render stalls only take effect while a
-  world is ticking, so `start_pie()` (or a standalone session) must be running — on the bare editor
-  viewport the game/render cases don't land. Only the `gpu` case affects the editor viewport.
-- Thread times reflect the **last completed frame**, so read `frame_timing` at least one frame *after*
-  `force_hitch` (the `hint` in the response says so).
-- **Confirming a CPU hitch over MCP/Python is racy.** The hitch produces a *visible* spike in the
-  on-screen `stat unit`, but the in-process reader (`frame_timing`) shares the game thread with the
-  stall, so a follow-up call reliably lands on a clean frame and reports a normal number. Trust
-  `stat unit` (or a trace) as ground truth for the CPU cases; the `gpu` case reads back cleanly.
-- `frames > 1` sustains the hitch across N frames — use it to reproduce **jitter**, not just a single spike.
-- `milliseconds` is clamped to `[1, 5000]` and `frames` to `[1, 600]` so a typo can't lock the editor.
+- **The CPU paths are race-free (issue #17).** Earlier, confirming a CPU hitch meant a follow-up
+  `frame_timing`, but that reader runs on the game thread the stall blocks, so it reliably landed on a
+  clean frame and missed the spike (the stall was real — visible in `stat unit` — just unread). Now
+  `force_hitch` times its *own* stall and returns `observed_peak_*_ms` + `verdict_matched_expect`, so
+  validation needs no second call.
+- **`rhi` needs a separate RHI thread.** Like the CPU paths it's race-free and self-measured
+  (`observed_peak_rhi_ms`), but the stall only lands when RHI-threading is on. When it's off the call
+  reports `rhi_threading: false` + an `rhi_warning` and induces **no** stall (mirroring how the verdict
+  drops RHI when it isn't a distinct thread) — re-run with `r.RHIThread.Enable 1`, or on a platform
+  where it's the default, to validate the `RHIThread` bound.
+- **`gpu` is the exception** — its cost is scene-dependent and persists across frames, so it can't be
+  measured synchronously but *does* read back cleanly: for `gpu` alone, call `frame_timing` on a
+  following frame and confirm `bound: "GPU"`.
+- A live game world makes the reading representative — `start_pie()` or a standalone — but the CPU
+  self-measurement holds even on the bare editor viewport (the stall is induced and timed directly).
+- `frames > 1` sustains the hitch across N applications (simulate **jitter**); CPU total is capped at
+  ~10 s of synchronous stall so a typo can't lock the editor (response reports `frames_requested` if capped).
+- `milliseconds` is clamped to `[1, 5000]` and `frames` to `[1, 600]`.
 - `gpu` is best-effort: on a trivial scene even 4× supersampling may not overtake the CPU threads.
   Prefer profiling in a representative/worst spot.
 
@@ -134,8 +145,38 @@ shader/PSO caches and on-demand cooked data, so it under-reports exactly the hit
 `start_pie()` exists for fast in-process sanity checks (and so `force_hitch` has a world to stall);
 when the numbers have to be trusted, capture a `start_standalone()` trace and `analyse()` it.
 
-> This project has a **~30 s load hitch** on standalone startup — give a standalone session 45–60 s
-> before stopping so your capture reflects steady-state, not loading.
+> A cold standalone pays a large **load / first-frame hitch** (this project's fixture spikes ~35–43 s
+> at frame 0), and cold caches keep the first minute load-dominated — so give a standalone session
+> **90 s+** before stopping if you want steady-state numbers. A shorter capture is still fine for
+> *demonstrating* the startup hitch (it's exactly what a warm PIE run hides), just not for hot-path
+> averages.
+
+## 📄 The HTML report (`report`)
+
+`report()` turns a session into a **self-contained HTML "printout"** you can open in any browser,
+screenshot, or drop into Discord/email — no login, no external assets (the CSS is inlined). It composes
+the live `frame_timing` verdict + budget with the most recent capture and writes
+`Saved/BoundHound/report_<timestamp>.html`, returning the path:
+
+```python
+import unreal, json
+# after a StartStandalone / StopStandalone (or a StartTrace / StopTrace):
+r = json.loads(unreal.BoundHoundService.report("Proteus perf", "both"))
+# -> {"report_file": ".../report_<ts>.html", "included_capture": true, "fix_count": 3, "bound": "GameThread"}
+```
+
+What it contains:
+- **Contrast tiles** — the warm in-process frame next to the capture's cold worst-frame and steady-state p95.
+- **An IN-PROCESS vs REPRESENTATIVE matrix** (only when a capture supplies the cold column) — the same
+  PIE-hides-it / standalone-catches-it story as [PIE vs Standalone](#-pie-vs-standalone), auto-filled:
+  numbers are live, the "where to improve" column is a fixed teaching layer.
+- **Thread breakdown**, **worst frames**, and **PSO-hitch count** from the capture.
+- A data-driven **"fix in this order"** list — each fix carries the concrete `stat`/console commands and
+  a link to the matching UE 5.8 docs.
+
+`source` is `"trace"` / `"logs"` / `"both"` (default), same as `analyse`; `file` overrides which
+capture to summarise (empty = the last trace started/stopped). With no capture available it still writes
+a verdict-only report (`included_capture: false`) — the matrix falls back to single-run tiles.
 
 ## ⏱️ Frame-time budgets
 
@@ -169,6 +210,7 @@ code and Blueprints:
 |---|---|
 | **GameThread** | Tick / Blueprint / AI / animation. `stat dumpframe -ms=0.5 -root=gamethread`. Fix is code/Blueprint, not CVars. |
 | **RenderThread** | Draw calls & primitives, dynamic shadow-casting lights. `stat scenerendering`. Instance/merge meshes, Nanite, cut dynamic lights. |
+| **RHIThread** | GPU-command submission (distinct from render-thread scene setup). Usually too many draw calls / state changes. `stat rhi`, draw-call count in `stat scenerendering`. Cut draw calls via merging/instancing/HISM, Nanite. *Only ranked when RHI-threading is on; otherwise its cost folds into RenderThread.* |
 | **GPU** | *Now* run `ProfileGPU`. Shadows (VSM), Lumen, translucency, resolution. |
 
 ## ⚠️ Gotchas

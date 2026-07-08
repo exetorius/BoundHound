@@ -12,7 +12,7 @@ namespace BoundHoundVerdict
 	// Result of classifying which thread bounds the frame. Mirrors the fields FrameTiming emits.
 	struct FVerdict
 	{
-		FString Bound;          // "GameThread" | "RenderThread" | "GPU"
+		FString Bound;          // "GameThread" | "RenderThread" | "RHIThread" | "GPU"
 		FString Confidence;     // "clear" | "moderate" | "marginal" | "none"
 		double  TopMs = 0.0;    // the bottleneck thread's ms
 		double  RunnerMs = 0.0; // the runner-up's ms
@@ -24,15 +24,20 @@ namespace BoundHoundVerdict
 	// Top must lead the runner-up by more than this fraction of its own cost to be a clear win.
 	static constexpr double CONTESTED_PCT = 0.10;
 
-	// Rank game/render/GPU (GPU only when its timing is available), then judge how decisive the winner is.
-	// RHI is deliberately NOT ranked here -- FrameTiming reports rhi_thread_ms but the verdict is a
-	// game/render/GPU decision, matching the shipping behaviour. (Adding RHI to the verdict is issue #2.)
-	inline FVerdict Classify(double GameMs, double RenderMs, double GpuMs, bool bGpuAvailable)
+	// Rank game/render/RHI/GPU, then judge how decisive the winner is. RHI and GPU each count only when
+	// their timing is available: GRHIThreadTime is 0 when RHI-threading is off (its cost then folds into the
+	// render thread, so ranking it would double-count), and GPU timing isn't always present. RHI IS a real
+	// distinct bottleneck -- draw-call submission can saturate it independently of render-thread scene setup
+	// (issue #2). Note only GPU-unavailable downgrades confidence to "moderate": a missing GPU number hides a
+	// possible bottleneck, whereas missing RHI just means its work was already counted on the render thread.
+	inline FVerdict Classify(double GameMs, double RenderMs, double RhiMs, double GpuMs,
+	                         bool bRhiAvailable, bool bGpuAvailable)
 	{
 		struct FThread { const TCHAR* Name; double Ms; };
-		TArray<FThread, TInlineAllocator<3>> Threads;
+		TArray<FThread, TInlineAllocator<4>> Threads;
 		Threads.Add({ TEXT("GameThread"),   GameMs });
 		Threads.Add({ TEXT("RenderThread"), RenderMs });
+		if (bRhiAvailable) Threads.Add({ TEXT("RHIThread"), RhiMs });
 		if (bGpuAvailable) Threads.Add({ TEXT("GPU"), GpuMs });
 		Threads.Sort([](const FThread& A, const FThread& B) { return A.Ms > B.Ms; });
 
@@ -82,5 +87,27 @@ namespace BoundHoundVerdict
 		B.FrameHeadroomMs  = B.BudgetMs - FrameMs;
 		B.bMeetsTarget     = FrameMs > 0.0 && FrameMs <= B.BudgetMs;
 		return B;
+	}
+
+	// Race-free self-validation for ForceHitch (issue #17). Given the peak per-thread ms the hitch
+	// actually induced -- measured synchronously by ForceHitch itself, NOT read back via a follow-up
+	// FrameTiming that races the stall on the game thread -- did the stall land on the thread(s) the
+	// caller asked for? MinExpectedMs is the floor a thread's induced time must clear to count as hit
+	// (set below the requested stall to tolerate scheduler slop). "gpu" is not validated here: its cost
+	// is scene-dependent and can't be measured synchronously, so it keeps the read-a-following-frame path.
+	// "rhi" self-validates only when RHI-threading is on (a distinct RHI thread exists to stall); the peak
+	// must clear the floor AND dominate both CPU threads, or the stall folded into the render thread and
+	// there's no RHIThread verdict to confirm (issue #2).
+	inline bool HitchMatchesExpect(const FString& Mode, double PeakGameMs, double PeakRenderMs,
+	                               double MinExpectedMs, double PeakRhiMs = 0.0)
+	{
+		const bool bGameHit   = PeakGameMs   >= MinExpectedMs;
+		const bool bRenderHit = PeakRenderMs >= MinExpectedMs;
+		const bool bRhiHit    = PeakRhiMs    >= MinExpectedMs;
+		if (Mode == TEXT("game"))   return bGameHit   && PeakGameMs   > PeakRenderMs;
+		if (Mode == TEXT("render")) return bRenderHit && PeakRenderMs > PeakGameMs;
+		if (Mode == TEXT("both"))   return bGameHit   && bRenderHit;
+		if (Mode == TEXT("rhi"))    return bRhiHit    && PeakRhiMs > PeakRenderMs && PeakRhiMs > PeakGameMs;
+		return false; // gpu / unknown -- not self-validated by induced CPU peaks
 	}
 }

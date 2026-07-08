@@ -9,6 +9,7 @@
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Dom/JsonObject.h"
+#include "HAL/FileManager.h"
 
 // Pure verdict/budget logic (BoundHoundVerdict.h) is exercised headless -- no editor, no live frame
 // globals -- and FrameTiming routes through the same helpers, so green here means the shipping verdict
@@ -29,7 +30,7 @@ bool FBoundHoundVerdictClearTest::RunTest(const FString&)
 
 	// Game clearly slowest -> GameThread, clear, runner-up is the next-slowest (GPU at 11).
 	{
-		const FVerdict V = Classify(25.0, 8.0, 11.0, /*bGpuAvailable*/ true);
+		const FVerdict V = Classify(25.0, 8.0, /*Rhi*/ 0.0, 11.0, /*bRhi*/ false, /*bGpuAvailable*/ true);
 		TestEqual(TEXT("game bound"), V.Bound, FString(TEXT("GameThread")));
 		TestEqual(TEXT("game confidence"), V.Confidence, FString(TEXT("clear")));
 		TestFalse(TEXT("game not contested"), V.bContested);
@@ -38,15 +39,30 @@ bool FBoundHoundVerdictClearTest::RunTest(const FString&)
 	}
 	// Render clearly slowest.
 	{
-		const FVerdict V = Classify(8.0, 25.0, 11.0, true);
+		const FVerdict V = Classify(8.0, 25.0, 0.0, 11.0, false, true);
 		TestEqual(TEXT("render bound"), V.Bound, FString(TEXT("RenderThread")));
 		TestEqual(TEXT("render confidence"), V.Confidence, FString(TEXT("clear")));
 	}
 	// GPU clearly slowest.
 	{
-		const FVerdict V = Classify(8.0, 11.0, 25.0, true);
+		const FVerdict V = Classify(8.0, 11.0, 0.0, 25.0, false, true);
 		TestEqual(TEXT("gpu bound"), V.Bound, FString(TEXT("GPU")));
 		TestEqual(TEXT("gpu confidence"), V.Confidence, FString(TEXT("clear")));
+	}
+	// RHI clearly slowest (RHI-threading on) -> a distinct RHI-bound verdict.
+	{
+		const FVerdict V = Classify(8.0, 11.0, /*Rhi*/ 25.0, 9.0, /*bRhi*/ true, true);
+		TestEqual(TEXT("rhi bound"), V.Bound, FString(TEXT("RHIThread")));
+		TestEqual(TEXT("rhi confidence"), V.Confidence, FString(TEXT("clear")));
+		TestFalse(TEXT("rhi not contested"), V.bContested);
+		TestEqual(TEXT("rhi runner-up is render"), V.RunnerName, FString(TEXT("RenderThread")));
+	}
+	// RHI available but not the winner -> existing game verdict is unchanged, RHI just joins the ranking.
+	{
+		const FVerdict V = Classify(25.0, 8.0, /*Rhi*/ 9.0, 11.0, /*bRhi*/ true, true);
+		TestEqual(TEXT("still game bound"), V.Bound, FString(TEXT("GameThread")));
+		TestEqual(TEXT("still clear"), V.Confidence, FString(TEXT("clear")));
+		TestFalse(TEXT("rhi present but not contested"), V.bContested);
 	}
 	return true;
 }
@@ -58,16 +74,22 @@ bool FBoundHoundVerdictContestedTest::RunTest(const FString&)
 	using namespace BoundHoundVerdict;
 
 	// Top two within 10% -> a tie: contested, confidence downgraded to marginal, runner-up named.
-	const FVerdict V = Classify(25.0, 24.0, 5.0, true);
+	const FVerdict V = Classify(25.0, 24.0, 0.0, 5.0, false, true);
 	TestEqual(TEXT("bound is the nominal top"), V.Bound, FString(TEXT("GameThread")));
 	TestTrue(TEXT("contested"), V.bContested);
 	TestEqual(TEXT("confidence marginal"), V.Confidence, FString(TEXT("marginal")));
 	TestEqual(TEXT("contested_with"), V.RunnerName, FString(TEXT("RenderThread")));
 
 	// marginal (tie) must win over moderate (GPU-unavailable) when both apply.
-	const FVerdict M = Classify(10.0, 9.5, 0.0, /*bGpuAvailable*/ false);
+	const FVerdict M = Classify(10.0, 9.5, 0.0, 0.0, false, /*bGpuAvailable*/ false);
 	TestTrue(TEXT("tie contested even w/o gpu"), M.bContested);
 	TestEqual(TEXT("marginal beats moderate"), M.Confidence, FString(TEXT("marginal")));
+
+	// RHI can contest the render thread -> contested tie names RHIThread as the runner-up.
+	const FVerdict R = Classify(8.0, 25.0, /*Rhi*/ 24.0, 5.0, /*bRhi*/ true, true);
+	TestEqual(TEXT("render nominally top"), R.Bound, FString(TEXT("RenderThread")));
+	TestTrue(TEXT("render/rhi contested"), R.bContested);
+	TestEqual(TEXT("contested_with rhi"), R.RunnerName, FString(TEXT("RHIThread")));
 	return true;
 }
 
@@ -78,12 +100,12 @@ bool FBoundHoundVerdictBoundaryTest::RunTest(const FString&)
 	using namespace BoundHoundVerdict;
 
 	// Exactly 10% margin is NOT contested (strict < CONTESTED_PCT). 10 vs 9 -> 1/10 == 0.10 -> clear.
-	const FVerdict V = Classify(10.0, 9.0, 3.0, true);
+	const FVerdict V = Classify(10.0, 9.0, 0.0, 3.0, false, true);
 	TestFalse(TEXT("exactly 10% is not contested"), V.bContested);
 	TestEqual(TEXT("boundary is clear"), V.Confidence, FString(TEXT("clear")));
 
 	// Just inside 10% (9.5/10 -> margin 0.5, 5%) IS contested.
-	const FVerdict C = Classify(10.0, 9.5, 3.0, true);
+	const FVerdict C = Classify(10.0, 9.5, 0.0, 3.0, false, true);
 	TestTrue(TEXT("just under 10% is contested"), C.bContested);
 	return true;
 }
@@ -96,11 +118,16 @@ bool FBoundHoundVerdictGpuUnavailableTest::RunTest(const FString&)
 
 	// GPU timing unavailable: GPU is dropped from the ranking, and a clear CPU winner is downgraded to
 	// "moderate" because a hidden GPU cost can't be ruled out.
-	const FVerdict V = Classify(25.0, 8.0, 0.0, /*bGpuAvailable*/ false);
+	const FVerdict V = Classify(25.0, 8.0, 0.0, 0.0, false, /*bGpuAvailable*/ false);
 	TestEqual(TEXT("bound game"), V.Bound, FString(TEXT("GameThread")));
 	TestEqual(TEXT("confidence moderate"), V.Confidence, FString(TEXT("moderate")));
 	TestFalse(TEXT("not contested"), V.bContested);
 	TestEqual(TEXT("runner is render (gpu excluded)"), V.RunnerName, FString(TEXT("RenderThread")));
+
+	// RHI unavailable must NOT downgrade confidence (its work was counted on the render thread) -- only a
+	// missing GPU number does. GPU present + RHI absent + clear CPU winner stays "clear".
+	const FVerdict G = Classify(25.0, 8.0, /*Rhi*/ 0.0, 11.0, /*bRhi*/ false, /*bGpuAvailable*/ true);
+	TestEqual(TEXT("rhi-absent stays clear"), G.Confidence, FString(TEXT("clear")));
 	return true;
 }
 
@@ -111,7 +138,7 @@ bool FBoundHoundVerdictNoneTest::RunTest(const FString&)
 	using namespace BoundHoundVerdict;
 
 	// No meaningful timing yet -> confidence "none", not contested.
-	const FVerdict V = Classify(0.0, 0.0, 0.0, true);
+	const FVerdict V = Classify(0.0, 0.0, 0.0, 0.0, false, true);
 	TestEqual(TEXT("confidence none"), V.Confidence, FString(TEXT("none")));
 	TestFalse(TEXT("zero not contested"), V.bContested);
 	return true;
@@ -226,7 +253,8 @@ bool FBoundHoundFrameTimingShapeTest::RunTest(const FString&)
 
 	// The live bound must be one of the known verdicts (or none when there's no timing).
 	const FString Bound = Obj->GetStringField(TEXT("bound"));
-	const bool bKnown = Bound == TEXT("GameThread") || Bound == TEXT("RenderThread") || Bound == TEXT("GPU");
+	const bool bKnown = Bound == TEXT("GameThread") || Bound == TEXT("RenderThread")
+		|| Bound == TEXT("RHIThread") || Bound == TEXT("GPU");
 	TestTrue(FString::Printf(TEXT("bound is a known thread: %s"), *Bound), bKnown);
 	return true;
 }
@@ -247,6 +275,139 @@ bool FBoundHoundForceHitchValidationTest::RunTest(const FString&)
 	}
 	TestFalse(TEXT("bad thread not success"), Obj->GetBoolField(TEXT("success")));
 	TestEqual(TEXT("error code"), Obj->GetStringField(TEXT("error_code")), FString(TEXT("BAD_THREAD")));
+	return true;
+}
+
+// Race-free self-validation logic (issue #17): given the peak per-thread ms a hitch induced, decide
+// whether it landed on the requested thread(s). Pure -> exercised headless, no live timing.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundHitchExpectTest,
+	"BoundHound.ForceHitch.MatchesExpect", kBHTestFlags)
+bool FBoundHoundHitchExpectTest::RunTest(const FString&)
+{
+	using namespace BoundHoundVerdict;
+	const double Min = 125.0; // half of a 250 ms stall
+
+	// game: game peak clears the floor AND dominates render -> match; render untouched must not match "game".
+	TestTrue (TEXT("game hit"),          HitchMatchesExpect(TEXT("game"),   250.0,   0.0, Min));
+	TestFalse(TEXT("game undershoot"),   HitchMatchesExpect(TEXT("game"),    50.0,   0.0, Min));
+	TestFalse(TEXT("game but render bigger"), HitchMatchesExpect(TEXT("game"), 250.0, 300.0, Min));
+
+	// render: symmetric.
+	TestTrue (TEXT("render hit"),        HitchMatchesExpect(TEXT("render"),   0.0, 250.0, Min));
+	TestFalse(TEXT("render undershoot"), HitchMatchesExpect(TEXT("render"),   0.0,  50.0, Min));
+
+	// both: both threads must clear the floor.
+	TestTrue (TEXT("both hit"),          HitchMatchesExpect(TEXT("both"),   250.0, 250.0, Min));
+	TestFalse(TEXT("both one short"),    HitchMatchesExpect(TEXT("both"),   250.0,  50.0, Min));
+
+	// rhi: the RHI peak (5th arg) must clear the floor AND dominate both CPU threads (issue #2).
+	TestTrue (TEXT("rhi hit"),           HitchMatchesExpect(TEXT("rhi"),      0.0,   0.0, Min, /*Rhi*/ 250.0));
+	TestFalse(TEXT("rhi undershoot"),    HitchMatchesExpect(TEXT("rhi"),      0.0,   0.0, Min, /*Rhi*/  50.0));
+	TestFalse(TEXT("rhi but render bigger"), HitchMatchesExpect(TEXT("rhi"),  0.0, 300.0, Min, /*Rhi*/ 250.0));
+	// rhi with no RHI peak (threading off -> stall folded into render) must not falsely match.
+	TestFalse(TEXT("rhi threading off"), HitchMatchesExpect(TEXT("rhi"),      0.0, 250.0, Min, /*Rhi*/   0.0));
+
+	// gpu / unknown are never self-validated by CPU peaks.
+	TestFalse(TEXT("gpu not matched here"), HitchMatchesExpect(TEXT("gpu"), 999.0, 999.0, Min));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundForceHitchSelfMeasureTest,
+	"BoundHound.ForceHitch.SelfMeasure", kBHTestFlags)
+bool FBoundHoundForceHitchSelfMeasureTest::RunTest(const FString&)
+{
+	// A game-thread stall must be induced AND measured within the single call: the response carries the
+	// observed peak and verdict_matched_expect=true, with no follow-up FrameTiming (issue #17).
+	const FString Json = UBoundHoundService::ForceHitch(TEXT("game"), 20.0f, 1);
+
+	TSharedPtr<FJsonObject> Obj;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Json);
+	if (!FJsonSerializer::Deserialize(Reader, Obj) || !Obj.IsValid())
+	{
+		AddError(FString::Printf(TEXT("ForceHitch did not return valid JSON: %s"), *Json.Left(200)));
+		return false;
+	}
+
+	TestTrue(TEXT("success"), Obj->GetBoolField(TEXT("success")));
+	TestTrue(TEXT("has observed_peak_game_ms"), Obj->HasField(TEXT("observed_peak_game_ms")));
+	TestTrue(TEXT("has verdict_matched_expect"), Obj->HasField(TEXT("verdict_matched_expect")));
+
+	// The 20 ms sleep should measure at least the 10 ms match floor (sleep never undershoots by half).
+	const double Peak = Obj->GetNumberField(TEXT("observed_peak_game_ms"));
+	TestTrue(FString::Printf(TEXT("induced >= 10ms (got %.1f)"), Peak), Peak >= 10.0);
+	TestTrue(TEXT("verdict matched"), Obj->GetBoolField(TEXT("verdict_matched_expect")));
+	return true;
+}
+
+// The rhi arm (issue #2) is a ground-truth trigger for the RHIThread verdict. Headless runs under
+// -nullrhi with no separate RHI thread, so this asserts the graceful fallback: the mode is accepted
+// (not BAD_THREAD), rhi_threading reports false, a warning is surfaced, and nothing was validated. The
+// live RHIThread-wins path can only be confirmed in a session with RHI-threading ON.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundForceHitchRhiTest,
+	"BoundHound.ForceHitch.RhiArm", kBHTestFlags)
+bool FBoundHoundForceHitchRhiTest::RunTest(const FString&)
+{
+	const FString Json = UBoundHoundService::ForceHitch(TEXT("rhi"), 20.0f, 1);
+
+	TSharedPtr<FJsonObject> Obj;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Json);
+	if (!FJsonSerializer::Deserialize(Reader, Obj) || !Obj.IsValid())
+	{
+		AddError(FString::Printf(TEXT("ForceHitch rhi did not return valid JSON: %s"), *Json.Left(200)));
+		return false;
+	}
+
+	// 'rhi' is a valid mode -- accepted, not rejected as BAD_THREAD.
+	TestTrue(TEXT("success"), Obj->GetBoolField(TEXT("success")));
+	TestEqual(TEXT("forcing rhi"), Obj->GetStringField(TEXT("forcing")), FString(TEXT("rhi")));
+	TestTrue(TEXT("has rhi_threading"), Obj->HasField(TEXT("rhi_threading")));
+
+	// Headless nullrhi has no separate RHI thread: expect the flagged fallback, no induced verdict.
+	if (!Obj->GetBoolField(TEXT("rhi_threading")))
+	{
+		TestTrue(TEXT("warns rhi-threading off"), Obj->HasField(TEXT("rhi_warning")));
+		TestFalse(TEXT("nothing validated w/o rhi thread"), Obj->GetBoolField(TEXT("verdict_matched_expect")));
+	}
+	return true;
+}
+
+// Report() renders a self-contained HTML "printout" from the live verdict + capture summary. Headless
+// (nullrhi, no trace) exercises the no-capture path: the file must still be written and the JSON
+// contract (report_file / fix_count / included_capture) honoured. The HTML body itself isn't asserted
+// field-by-field -- this guards that the tool writes a real file and reports it, not the layout.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundReportSmokeTest,
+	"BoundHound.Report.WritesFile", kBHTestFlags)
+bool FBoundHoundReportSmokeTest::RunTest(const FString&)
+{
+	const FString Json = UBoundHoundService::Report(TEXT("Smoke Test"), TEXT("both"), TEXT(""));
+
+	TSharedPtr<FJsonObject> Obj;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Json);
+	if (!FJsonSerializer::Deserialize(Reader, Obj) || !Obj.IsValid())
+	{
+		AddError(FString::Printf(TEXT("Report did not return valid JSON: %s"), *Json.Left(200)));
+		return false;
+	}
+
+	TestTrue(TEXT("success"), Obj->GetBoolField(TEXT("success")));
+
+	// Contract fields.
+	TestTrue(TEXT("has report_file"), Obj->HasField(TEXT("report_file")));
+	TestTrue(TEXT("has fix_count"), Obj->HasField(TEXT("fix_count")));
+	TestTrue(TEXT("has included_capture"), Obj->HasField(TEXT("included_capture")));
+
+	// No trace is available headless, so the capture column must be absent.
+	TestFalse(TEXT("no capture headless"), Obj->GetBoolField(TEXT("included_capture")));
+
+	// The reported path must point at a real, non-empty file on disk.
+	const FString Path = Obj->GetStringField(TEXT("report_file"));
+	TestTrue(TEXT("report_file non-empty"), !Path.IsEmpty());
+	IFileManager& FM = IFileManager::Get();
+	if (TestTrue(FString::Printf(TEXT("file exists: %s"), *Path), FM.FileExists(*Path)))
+	{
+		TestTrue(TEXT("file has content"), FM.FileSize(*Path) > 0);
+		FM.Delete(*Path); // don't litter the project's Saved dir with test artifacts
+	}
 	return true;
 }
 
