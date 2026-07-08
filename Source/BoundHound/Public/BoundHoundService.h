@@ -67,6 +67,22 @@ public:
 	static FString ForceHitch(const FString& Thread = TEXT("game"), float Milliseconds = 250.0f, int32 Frames = 1);
 
 	/**
+	 * Render a self-contained HTML performance report from the current verdict and the most recent capture,
+	 * and write it to <Project>/Saved/BoundHound/report_<timestamp>.html -- a shareable "printout" you can
+	 * open in any browser, screenshot, or hand to the team. Pulls the live FrameTiming verdict + budget and
+	 * (when a trace/log is available) the Analyse frame stats, worst frames and PSO hitches, then builds a
+	 * data-driven "fix in this order" list -- each fix carries the concrete stat/console commands to run and
+	 * a link to the matching Unreal Engine docs. No external assets (CSS is inlined), so the file is portable.
+	 *
+	 * @param Title  Heading for the report. Defaults to "BoundHound Performance Report".
+	 * @param Source "trace", "logs", or "both" (default) -- which capture to summarise, same as Analyse.
+	 * @param File   Optional trace/log override; empty uses the last trace started/stopped.
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "BoundHound|Performance")
+	static FString Report(const FString& Title = TEXT("BoundHound Performance Report"),
+	                      const FString& Source = TEXT("both"), const FString& File = TEXT(""));
+
+	/**
 	 * Start an Unreal Insights trace to file.
 	 * @param Name Trace file name (without extension).
 	 * @param Channels Comma-separated trace channels; empty uses the default set (frame,cpu,gpu,log,...).

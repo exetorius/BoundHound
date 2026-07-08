@@ -9,6 +9,7 @@
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Dom/JsonObject.h"
+#include "HAL/FileManager.h"
 
 // Pure verdict/budget logic (BoundHoundVerdict.h) is exercised headless -- no editor, no live frame
 // globals -- and FrameTiming routes through the same helpers, so green here means the shipping verdict
@@ -328,6 +329,46 @@ bool FBoundHoundForceHitchSelfMeasureTest::RunTest(const FString&)
 	const double Peak = Obj->GetNumberField(TEXT("observed_peak_game_ms"));
 	TestTrue(FString::Printf(TEXT("induced >= 10ms (got %.1f)"), Peak), Peak >= 10.0);
 	TestTrue(TEXT("verdict matched"), Obj->GetBoolField(TEXT("verdict_matched_expect")));
+	return true;
+}
+
+// Report() renders a self-contained HTML "printout" from the live verdict + capture summary. Headless
+// (nullrhi, no trace) exercises the no-capture path: the file must still be written and the JSON
+// contract (report_file / fix_count / included_capture) honoured. The HTML body itself isn't asserted
+// field-by-field -- this guards that the tool writes a real file and reports it, not the layout.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundReportSmokeTest,
+	"BoundHound.Report.WritesFile", kBHTestFlags)
+bool FBoundHoundReportSmokeTest::RunTest(const FString&)
+{
+	const FString Json = UBoundHoundService::Report(TEXT("Smoke Test"), TEXT("both"), TEXT(""));
+
+	TSharedPtr<FJsonObject> Obj;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Json);
+	if (!FJsonSerializer::Deserialize(Reader, Obj) || !Obj.IsValid())
+	{
+		AddError(FString::Printf(TEXT("Report did not return valid JSON: %s"), *Json.Left(200)));
+		return false;
+	}
+
+	TestTrue(TEXT("success"), Obj->GetBoolField(TEXT("success")));
+
+	// Contract fields.
+	TestTrue(TEXT("has report_file"), Obj->HasField(TEXT("report_file")));
+	TestTrue(TEXT("has fix_count"), Obj->HasField(TEXT("fix_count")));
+	TestTrue(TEXT("has included_capture"), Obj->HasField(TEXT("included_capture")));
+
+	// No trace is available headless, so the capture column must be absent.
+	TestFalse(TEXT("no capture headless"), Obj->GetBoolField(TEXT("included_capture")));
+
+	// The reported path must point at a real, non-empty file on disk.
+	const FString Path = Obj->GetStringField(TEXT("report_file"));
+	TestTrue(TEXT("report_file non-empty"), !Path.IsEmpty());
+	IFileManager& FM = IFileManager::Get();
+	if (TestTrue(FString::Printf(TEXT("file exists: %s"), *Path), FM.FileExists(*Path)))
+	{
+		TestTrue(TEXT("file has content"), FM.FileSize(*Path) > 0);
+		FM.Delete(*Path); // don't litter the project's Saved dir with test artifacts
+	}
 	return true;
 }
 
