@@ -14,9 +14,15 @@ from Python with no C++ required. Run everything here from the editor's Python c
 | `bookmark(name)` | Drop a point-in-time bookmark in the active trace. |
 | `region_start(name)` / `region_end(name)` | Begin / end a named region span in the active trace. |
 | `analyse(source="both", file="")` | Read back trace and/or log → frame stats, worst frames, hitches, notable log lines. |
-| `start_standalone(name, channels)` | Launch the game as a separate standalone process with a trace attached. Writes its own **timestamped log** (`<name>_<YYYYMMDD_HHMMSS>.log`) via `-abslog`, so `analyse("logs")` reads the standalone's log, not the editor's locked one. |
-| `stop_standalone()` / `get_standalone_status()` | Control / inspect the standalone capture. |
+| `start_standalone(name, channels)` | Launch the game as a separate standalone process with a trace attached. Writes its trace to `Saved/Profiling/<name>_<YYYYMMDD_HHMMSS>.utrace` and its own log to `Saved/Logs/<name>_<YYYYMMDD_HHMMSS>.log` (`-abslog`), so `analyse` reads this run's files, not the editor's. The `trace_file` it returns is the file that gets written; `get_standalone_status()` and `stop_standalone()` report the same path. |
+| `stop_standalone()` / `get_standalone_status()` | Control / inspect the standalone capture. `stop_standalone()` also returns `trace_file_exists` and `file_size_mb`, or a `trace_warning` if nothing was written. |
 | `start_pie()` / `stop_pie()` | Start/stop **in-process** Play-In-Editor (opens a PIE window in the editor process). Makes `frame_timing`/`force_hitch` read a live game world. See [PIE vs Standalone](#-pie-vs-standalone). |
+
+> **One play session at a time.** `start_pie()` and `start_standalone()` refuse to start while another
+> play session is running, queued, or **still ending**, and return `error_code: "PLAY_SESSION_ACTIVE"`.
+> Stopping PIE only *requests* the end; the teardown happens on the next engine tick. So stop the
+> session, end your Python call / MCP request so the engine can tick, and start the next session in a
+> new call. (Before v1.0.1, starting a standalone in the same call as a PIE stop crashed the editor.)
 | `report(title, source="both", file="")` | Render a **self-contained HTML report** from the live verdict/budget + the most recent capture (frame stats, worst frames, PSO hitches) with a data-driven "fix in this order" list, to `Saved/BoundHound/report_<ts>.html`. See [The HTML report](#-the-html-report-report). |
 
 All methods return a JSON string. For a representative reading, profile under PIE or a standalone
@@ -52,6 +58,18 @@ a winner:
   `contested_with` names the runner-up. Frame-to-frame noise can flip which one "wins", so treat both
   as bottlenecks — take several readings or trace both.
 - **`margin_ms`** — how far the bottleneck leads the runner-up, in ms.
+- **`frame_number` / `timestamp`** — which engine frame (`GFrameCounter`) the reading describes, and
+  when it was taken (UTC). Use them to spot stale reads.
+- **`repeat_read`** — `true` when no new frame has completed since the previous call. The reading is
+  then the *same frame again*, so `bound_confidence` is forced to `none` and the `hint` starts with
+  `REPEAT READ`.
+- **`warming` / `pie_seconds`** — `warming` is `true` for the first ~10 s of PIE, when frames are
+  dominated by shader/PSO compiles and streaming. The `hint` starts with `WARMING`; read again later.
+
+> **Sample across separate calls.** `frame_timing` reads the last *completed* frame. While your Python
+> call (or MCP request) is running, the game thread is blocked, so no frame completes — calling it five
+> times in one script, even with `time.sleep()` between, returns the same frame five times. Take each
+> sample in its own call so the engine gets to tick in between.
 
 If `gpu_ms` is `0` the GPU column is dropped from the ranking (its timing is unavailable that frame),
 and any CPU verdict is downgraded to `moderate` — confirm it with the `r.ScreenPercentage 50` test.
@@ -167,6 +185,10 @@ r = json.loads(unreal.BoundHoundService.report("Proteus perf", "both"))
 
 What it contains:
 - **Contrast tiles** — the warm in-process frame next to the capture's cold worst-frame and steady-state p95.
+  The in-process frame is only shown and compared when it's a fresh, settled PIE frame. If PIE is still
+  warming up, the read is a repeat, or PIE isn't running, the tile says why (`n/a`). That frame's
+  verdict doesn't drive a fix either; the fix list instead starts with how to get a usable reading. The JSON result then has `in_process_representative: false` and an
+  `in_process_caveat`.
 - **An IN-PROCESS vs REPRESENTATIVE matrix** (only when a capture supplies the cold column) — the same
   PIE-hides-it / standalone-catches-it story as [PIE vs Standalone](#-pie-vs-standalone), auto-filled:
   numbers are live, the "where to improve" column is a fixed teaching layer.

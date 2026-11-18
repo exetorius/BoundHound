@@ -67,6 +67,26 @@ static bool IsPIERunning()
 	return GEditor && GEditor->PlayWorld != nullptr;
 }
 
+// Issue #28: why a new play session can't start right now (empty = safe).
+static FString PlaySessionBusyReason()
+{
+	if (!GEditor) return FString();
+	return BoundHoundVerdict::PlaySessionBusyReason(
+		GEditor->ShouldEndPlayMap(), GEditor->IsPlaySessionRequestQueued(),
+		GEditor->PlayWorld != nullptr, GEditor->IsPlayingSessionInEditor());
+}
+
+static FString PlaySessionBusyError(const FString& Reason)
+{
+	return ErrJson(TEXT("PLAY_SESSION_ACTIVE"), FString::Printf(
+		TEXT("Can't start a play session: %s. Stop it, then return control to the engine for at least one frame (end this Python call / MCP request) before starting another."),
+		*Reason));
+}
+
+// Issue #27: last frame FrameTiming read, to flag repeat reads of the same frame.
+static bool   GHasLastTimingFrame = false;
+static uint64 GLastTimingFrame    = 0;
+
 static const TCHAR* DefaultTraceChannels()
 {
 	return TEXT("frame,cpu,gpu,log,loadtime,object,stats,bookmark,region");
@@ -82,58 +102,6 @@ static FString BuildTraceFilePath(const FString& Name)
 	FString Dir = ProjectSavedDirAbs() / TEXT("Profiling");
 	IPlatformFile::GetPlatformPhysical().CreateDirectoryTree(*Dir);
 	return Dir / Name;
-}
-
-// Read StoreDir from the Unreal Trace Server settings file (used when -tracehost is set).
-static FString GetUTSStoreDir()
-{
-	FString SettingsPath = FPlatformMisc::GetEnvironmentVariable(TEXT("LOCALAPPDATA"))
-		/ TEXT("UnrealEngine/Common/UnrealTrace/Settings.ini");
-
-	FString Content;
-	if (!FFileHelper::LoadFileToString(Content, *SettingsPath))
-	{
-		return FString();
-	}
-
-	TArray<FString> Lines;
-	Content.ParseIntoArrayLines(Lines);
-	for (const FString& Line : Lines)
-	{
-		if (Line.StartsWith(TEXT("StoreDir=")))
-		{
-			FString Dir = Line.Mid(9).TrimStartAndEnd();
-			FPaths::NormalizeFilename(Dir);
-			return Dir;
-		}
-	}
-	return FString();
-}
-
-// Find the most recently modified .utrace file in the UTS store.
-static FString FindLatestUTSTrace()
-{
-	FString StoreDir = GetUTSStoreDir();
-	if (StoreDir.IsEmpty()) return FString();
-
-	FString Latest;
-	FDateTime LatestTime = FDateTime::MinValue();
-
-	IFileManager::Get().IterateDirectory(*StoreDir, [&](const TCHAR* Path, bool bDir) -> bool
-	{
-		if (!bDir && FPaths::GetExtension(Path).Equals(TEXT("utrace"), ESearchCase::IgnoreCase))
-		{
-			FDateTime T = IFileManager::Get().GetTimeStamp(Path);
-			if (T > LatestTime)
-			{
-				LatestTime = T;
-				Latest = Path;
-			}
-		}
-		return true;
-	});
-
-	return Latest;
 }
 
 // ---------------------------------------------------------------------------
@@ -415,15 +383,48 @@ FString UBoundHoundService::FrameTiming(float TargetFPS)
 	const double  MarginMs   = Verdict.MarginMs;
 	const bool    bContested = Verdict.bContested;
 
+	// --- Freshness (issue #27) + warm-up (issue #23) ---------------------------------------------------
+	// The thread globals describe the last COMPLETED frame. If no frame has completed since the previous
+	// read (caller is holding the game thread), this is the same frame again -- not a new sample.
+	const uint64 FrameNumber = GFrameCounter;
+	const bool bRepeatRead = BoundHoundVerdict::IsRepeatRead(GHasLastTimingFrame, FrameNumber, GLastTimingFrame);
+	GHasLastTimingFrame = true;
+	GLastTimingFrame    = FrameNumber;
+	R->SetNumberField(TEXT("frame_number"), (double)FrameNumber);
+	R->SetStringField(TEXT("timestamp"), FDateTime::UtcNow().ToIso8601());
+	R->SetBoolField(TEXT("repeat_read"), bRepeatRead);
+
+	const bool bPIE = IsPIERunning();
+	const double PieSeconds = bPIE ? GEditor->PlayWorld->GetRealTimeSeconds() : -1.0;
+	const bool bWarming = bPIE && BoundHoundVerdict::IsWarming(PieSeconds);
+	if (bPIE) R->SetNumberField(TEXT("pie_seconds"), Round2(PieSeconds));
+	R->SetBoolField(TEXT("warming"), bWarming);
+
 	R->SetStringField(TEXT("bound"), Bound);
-	R->SetStringField(TEXT("bound_confidence"), Verdict.Confidence);
+	R->SetStringField(TEXT("bound_confidence"), bRepeatRead ? FString(TEXT("none")) : Verdict.Confidence);
 	R->SetNumberField(TEXT("margin_ms"), Round2(MarginMs));
 	R->SetBoolField(TEXT("contested"), bContested);
 
-	FString Hint = BoundHint(Bound);
 	if (bContested && !RunnerName.IsEmpty())
 	{
 		R->SetStringField(TEXT("contested_with"), RunnerName);
+	}
+
+	FString Hint = BoundHint(Bound);
+	if (bRepeatRead)
+	{
+		Hint = FString::Printf(
+			TEXT("REPEAT READ: no new frame since the last call (frame %llu) -- this is the same frame again, not a new sample. Return control to the engine between samples (separate Python calls / MCP requests); sleeping inside one call does not let frames advance."),
+			FrameNumber);
+	}
+	else if (bWarming)
+	{
+		Hint = FString::Printf(
+			TEXT("WARMING: PIE started %.1f s ago -- early frames are dominated by shader/PSO compiles and streaming and are not representative. Read again after ~%.0f s. %s"),
+			PieSeconds, BoundHoundVerdict::SETTLE_SECONDS, *BoundHint(Bound));
+	}
+	else if (bContested && !RunnerName.IsEmpty())
+	{
 		Hint = FString::Printf(
 			TEXT("CONTESTED: %s (%.2f ms) and %s (%.2f ms) are within %.2f ms -- frame-to-frame noise can flip which one 'wins', so treat both as bottlenecks. Take several readings, or trace both. %s"),
 			*Bound, TopMs, *RunnerName, RunnerMs, MarginMs, *BoundHint(Bound));
@@ -481,7 +482,6 @@ FString UBoundHoundService::FrameTiming(float TargetFPS)
 	}
 	R->SetObjectField(TEXT("budget"), Budget);
 
-	const bool bPIE = IsPIERunning();
 	R->SetBoolField(TEXT("pie_running"), bPIE);
 	R->SetStringField(TEXT("note"),
 		bPIE
@@ -818,6 +818,18 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 	const double TargetFps= Num(Budget, TEXT("target_fps"), 60.0);
 	const bool bMeets     = Budget.IsValid() && Budget->GetBoolField(TEXT("meets_target"));
 	const bool bPIE       = FT->GetBoolField(TEXT("pie_running"));
+	bool bRepeatRead = false, bWarming = false;
+	FT->TryGetBoolField(TEXT("repeat_read"), bRepeatRead);
+	FT->TryGetBoolField(TEXT("warming"), bWarming);
+	const double PieSeconds = Num(FT, TEXT("pie_seconds"));
+
+	// Issue #23: a single in-process frame is only worth comparing against a capture when it's a fresh,
+	// settled PIE frame. Otherwise say why it isn't representative instead of printing it as a headline.
+	FString InProcCaveat;
+	if (bRepeatRead)  InProcCaveat = TEXT("repeat read — no new frame since the last sample");
+	else if (!bPIE)   InProcCaveat = TEXT("editor viewport, not your game (PIE not running)");
+	else if (bWarming) InProcCaveat = FString::Printf(TEXT("PIE warming up (%.0f s in) — not representative"), PieSeconds);
+	const bool bInProcRepresentative = InProcCaveat.IsEmpty();
 
 	const bool bHasTrace = Trace.IsValid() && Num(Trace, TEXT("frame_count")) > 0.0;
 	const double MaxFrameMs = Num(Trace, TEXT("max_frame_ms"));
@@ -840,7 +852,18 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 			TEXT("# Ship a bundled PSO cache + keep precaching on (default):\nr.PSOPrecache.GlobalShaders 1\n# Then async-stream the opening level so the first frame isn't a hard stall."),
 			BoundHoundDocs::PsoPrecache, TEXT("PSO Precaching — UE 5.8 docs") });
 	}
-	if (Bound == TEXT("GameThread"))
+	// Only a fresh, settled PIE frame gets to drive the bound fix. A warming-up or repeated frame is noise
+	// (issue #23: a PIE start-up frame got the run labelled GPU-bound), and an editor-viewport frame measures
+	// the editor, not the game. Instead, tell the reader how to get a usable verdict.
+	const bool bVerdictUsable = bInProcRepresentative;
+	if (!bVerdictUsable)
+	{
+		Fixes.Add({ TEXT("Get a usable CPU-vs-GPU verdict first"),
+			FString::Printf(TEXT("The in-process frame isn't representative (%s), so this report doesn't say which thread bounds your game."), *InProcCaveat),
+			TEXT("# In separate calls, so frames can advance between them:\nstart_pie()\n# ...wait ~10 s for PIE to settle, park in a representative spot...\nframe_timing()\nreport(...)"),
+			BoundHoundDocs::Profiling, TEXT("Performance Profiling — UE 5.8 docs") });
+	}
+	else if (Bound == TEXT("GameThread"))
 	{
 		Fixes.Add({ TEXT("Game-thread bound — CPU logic cost"),
 			TEXT("Tick / Blueprint / AI / animation dominate the frame. Dropping resolution or GPU cost will not help a game-thread-bound frame."),
@@ -896,20 +919,34 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 	H += TEXT("<div class=\"tiles\">");
 	if (bHasTrace)
 	{
-		const double Ratio = FrameMs > 0.0 ? (P95Ms / FrameMs) : 0.0;
-		H += FString::Printf(TEXT("<div class=\"tile warn\"><p class=\"k\">In-process (warm)</p><p class=\"v\">%.1f<small>ms</small></p><p class=\"s\">%.0f fps &middot; %s &middot; budget %s</p></div>"),
-			FrameMs, Fps, *BHHtmlEscape(Bound.IsEmpty() ? TEXT("—") : Bound), bMeets ? TEXT("PASS") : TEXT("FAIL"));
+		if (bInProcRepresentative)
+		{
+			H += FString::Printf(TEXT("<div class=\"tile warn\"><p class=\"k\">In-process (warm)</p><p class=\"v\">%.1f<small>ms</small></p><p class=\"s\">%.0f fps &middot; %s &middot; budget %s</p></div>"),
+				FrameMs, Fps, *BHHtmlEscape(Bound.IsEmpty() ? TEXT("—") : Bound), bMeets ? TEXT("PASS") : TEXT("FAIL"));
+		}
+		else
+		{
+			H += FString::Printf(TEXT("<div class=\"tile\"><p class=\"k\">In-process (warm)</p><p class=\"v\" style=\"font-size:22px\">n/a</p><p class=\"s\">%s. Sampled %.1f ms — not used for comparison.</p></div>"),
+				*BHHtmlEscape(InProcCaveat), FrameMs);
+		}
 		H += FString::Printf(TEXT("<div class=\"tile crit\"><p class=\"k\">Worst frame (cold)</p><p class=\"v\">%s<small>ms</small></p><p class=\"s\">The frame-0 stall the warm reading hid.</p></div>"),
 			*FString::FormatAsNumber((int64)MaxFrameMs));
-		H += FString::Printf(TEXT("<div class=\"tile %s\"><p class=\"k\">Steady-state (p95)</p><p class=\"v\">%.0f<small>ms</small></p><p class=\"s\">~%.0f&times; the %.1f ms in-process frame.</p></div>"),
-			P95Ms > BudgetMs ? TEXT("crit") : TEXT("good"), P95Ms, Ratio, FrameMs);
+		const FString RatioText = bInProcRepresentative ? BoundHoundVerdict::DescribeRatio(P95Ms, FrameMs) : FString();
+		const FString SteadySub = RatioText.IsEmpty()
+			? FString::Printf(TEXT("avg %.1f fps over the capture."), AvgFps)
+			: FString::Printf(TEXT("%s the %.1f ms in-process frame."), *RatioText, FrameMs);
+		H += FString::Printf(TEXT("<div class=\"tile %s\"><p class=\"k\">Steady-state (p95)</p><p class=\"v\">%.0f<small>ms</small></p><p class=\"s\">%s</p></div>"),
+			P95Ms > BudgetMs ? TEXT("crit") : TEXT("good"), P95Ms, *BHHtmlEscape(SteadySub));
 	}
 	else
 	{
-		H += FString::Printf(TEXT("<div class=\"tile %s\"><p class=\"k\">Frame</p><p class=\"v\">%.1f<small>ms</small></p><p class=\"s\">%.0f fps live</p></div>"),
-			FrameMs > BudgetMs ? TEXT("crit") : TEXT("good"), FrameMs, Fps);
-		H += FString::Printf(TEXT("<div class=\"tile %s\"><p class=\"k\">Bound</p><p class=\"v\" style=\"font-size:22px\">%s</p><p class=\"s\">%s confidence</p></div>"),
-			ConfClass(Conf), *BHHtmlEscape(Bound.IsEmpty() ? TEXT("—") : Bound), *BHHtmlEscape(Conf));
+		H += FString::Printf(TEXT("<div class=\"tile %s\"><p class=\"k\">Frame</p><p class=\"v\">%.1f<small>ms</small></p><p class=\"s\">%.0f fps live%s%s</p></div>"),
+			!bVerdictUsable ? TEXT("") : (FrameMs > BudgetMs ? TEXT("crit") : TEXT("good")), FrameMs, Fps,
+			bVerdictUsable ? TEXT("") : TEXT(" &middot; "), bVerdictUsable ? TEXT("") : *BHHtmlEscape(InProcCaveat));
+		H += FString::Printf(TEXT("<div class=\"tile %s\"><p class=\"k\">Bound</p><p class=\"v\" style=\"font-size:22px\">%s</p><p class=\"s\">%s</p></div>"),
+			bVerdictUsable ? ConfClass(Conf) : TEXT(""),
+			*BHHtmlEscape(!bVerdictUsable || Bound.IsEmpty() ? TEXT("n/a") : Bound),
+			*BHHtmlEscape(bVerdictUsable ? Conf + TEXT(" confidence") : FString(TEXT("not your game's frame"))));
 		H += FString::Printf(TEXT("<div class=\"tile %s\"><p class=\"k\">Budget @ %.0f fps</p><p class=\"v\" style=\"font-size:22px\">%s</p><p class=\"s\">%.2f ms/frame budget</p></div>"),
 			bMeets ? TEXT("good") : TEXT("crit"), TargetFps, bMeets ? TEXT("PASS") : TEXT("FAIL"), BudgetMs);
 	}
@@ -934,8 +971,11 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 			*FString::FormatAsNumber((int64)MaxFrameMs));
 		H += FString::Printf(TEXT("<tr><td class=\"dim\">PSO hitches<small>pipeline stalls</small></td><td class=\"warm\">Not surfaced</td><td class=\"cold\"><b>%d</b> from <code>-logPSO</code>%s</td><td class=\"rec-cell\">Bundle a gathered PSO cache with the build — folds into the startup fix</td></tr>"),
 			PsoHitches, PsoHitches > 0 ? TEXT(" <span class=\"tag warn\">hitch</span>") : TEXT(""));
-		H += FString::Printf(TEXT("<tr class=\"bound\"><td class=\"dim\">Steady-state frame<small>hot path</small></td><td class=\"warm\"><b>%.1f ms</b> &middot; %s &middot; %.0f fps</td><td class=\"cold\"><b>p95 %.0f ms</b> &middot; avg <b>%.1f fps</b> &middot; %d frames</td><td class=\"rec-cell\">%s</td></tr>"),
-			FrameMs, *BHHtmlEscape(Bound.IsEmpty() ? TEXT("—") : Bound), Fps, P95Ms, AvgFps, FrameCount, SteadyRec);
+		const FString WarmSteady = bInProcRepresentative
+			? FString::Printf(TEXT("<b>%.1f ms</b> &middot; %s &middot; %.0f fps"), FrameMs, *BHHtmlEscape(Bound.IsEmpty() ? TEXT("—") : Bound), Fps)
+			: FString::Printf(TEXT("<span class=\"tag warn\">not representative</span> %s"), *BHHtmlEscape(InProcCaveat));
+		H += FString::Printf(TEXT("<tr class=\"bound\"><td class=\"dim\">Steady-state frame<small>hot path</small></td><td class=\"warm\">%s</td><td class=\"cold\"><b>p95 %.0f ms</b> &middot; avg <b>%.1f fps</b> &middot; %d frames</td><td class=\"rec-cell\">%s</td></tr>"),
+			*WarmSteady, P95Ms, AvgFps, FrameCount, bVerdictUsable ? SteadyRec : TEXT("Take an in-process reading in settled PIE for the bound verdict (see the fix list)"));
 		H += FString::Printf(TEXT("<tr><td class=\"dim\">Render thread<small>attribution</small></td><td class=\"warm\">Reads <b>%.1f ms</b> in-process</td><td class=\"cold\">Captured per-frame in the trace</td><td class=\"rec-cell\">Use a representative trace for render / RHI attribution — in-process render time is not shipping-accurate</td></tr>"),
 			RenderMs);
 		H += TEXT("<tr><td class=\"dim\">Bound verdict<small>CPU vs GPU</small></td><td class=\"warm\">Live — <code>FrameTiming</code> / <code>ForceHitch</code> self-measure</td><td class=\"cold\">Read via trace + <code>Analyse</code></td><td class=\"rec-cell\">In-process for the fast verdict + hitch self-validation; representative for <i>where</i> the ms goes</td></tr>");
@@ -1031,6 +1071,8 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 	R->SetNumberField(TEXT("fix_count"), Fixes.Num());
 	R->SetBoolField(TEXT("included_capture"), bHasTrace);
 	R->SetStringField(TEXT("bound"), Bound);
+	R->SetBoolField(TEXT("in_process_representative"), bInProcRepresentative);
+	if (!bInProcRepresentative) R->SetStringField(TEXT("in_process_caveat"), InProcCaveat);
 	R->SetStringField(TEXT("hint"), FString::Printf(
 		TEXT("Self-contained HTML written. Open it in any browser or screenshot it to share: %s"), *Path));
 	return OkJson(R);
@@ -1069,15 +1111,15 @@ FString UBoundHoundService::StopTrace()
 	{
 		return ErrJson(TEXT("NOT_TRACING"), TEXT("No trace is active."));
 	}
+	// Issue #24: ask the engine where the trace is actually going (it may have adjusted the name, e.g.
+	// -tracefiletimestamps) instead of guessing "newest .utrace in the trace store", which can pick up an
+	// unrelated trace.
+	const FString Dest = FTraceAuxiliary::GetTraceDestinationString();
 	FTraceAuxiliary::Stop();
-
-	FString UTSTrace = FindLatestUTSTrace();
-	if (!UTSTrace.IsEmpty())
+	if (!Dest.IsEmpty() && IFileManager::Get().FileExists(*Dest))
 	{
-		FDateTime StoredTime = GLastTraceFilePath.IsEmpty() ? FDateTime::MinValue()
-			: IFileManager::Get().GetTimeStamp(*GLastTraceFilePath);
-		FDateTime UTSTime = IFileManager::Get().GetTimeStamp(*UTSTrace);
-		if (UTSTime > StoredTime) GLastTraceFilePath = UTSTrace;
+		GLastTraceFilePath = FPaths::ConvertRelativePathToFull(Dest);
+		FPaths::NormalizeFilename(GLastTraceFilePath);
 	}
 
 	int64 FileSizeBytes = GLastTraceFilePath.IsEmpty() ? 0
@@ -1166,11 +1208,19 @@ FString UBoundHoundService::StartStandalone(const FString& Name, const FString& 
 {
 	if (!GEditor) return ErrJson(TEXT("NO_EDITOR"), TEXT("GEditor not available."));
 	if (GStandaloneRunning) return ErrJson(TEXT("ALREADY_RUNNING"), TEXT("Standalone is already running. Call StopStandalone first."));
+	const FString Busy = PlaySessionBusyReason();
+	if (!Busy.IsEmpty()) return PlaySessionBusyError(Busy);
 
 	const FString TraceName = Name.IsEmpty() ? TEXT("standalone_capture") : Name;
 	const FString ChannelSet = Channels.IsEmpty() ? FString(DefaultTraceChannels()) : Channels;
-	FString TracePath = BuildTraceFilePath(TraceName);
-	GLastTraceFilePath = TracePath + TEXT(".utrace");
+	const FString RunStamp = FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"));
+
+	// Issue #24: write the trace straight to a known, unique file. We used to pass -tracehost too, but the
+	// engine prefers -tracehost over -tracefile, so the trace went to the Unreal Trace Server store under a
+	// timestamp name and the path we reported here was never written. File-only = start, status and stop
+	// all name the same file (same reasoning as the -abslog log fix below).
+	const FString TracePath = BuildTraceFilePath(FString::Printf(TEXT("%s_%s"), *TraceName, *RunStamp)) + TEXT(".utrace");
+	GLastTraceFilePath = TracePath;
 
 	// Give the standalone process its own timestamped log via -abslog, rather than sharing the
 	// project's default <Project>.log. That file is held open by the running editor, so LoadFileToString
@@ -1178,12 +1228,11 @@ FString UBoundHoundService::StartStandalone(const FString& Name, const FString& 
 	// the editor's live log instead of the standalone's. A dedicated, unique path is unlocked and exact.
 	FString LogDir = ProjectSavedDirAbs() / TEXT("Logs");
 	IPlatformFile::GetPlatformPhysical().CreateDirectoryTree(*LogDir);
-	FString StandaloneLogPath = LogDir / FString::Printf(TEXT("%s_%s.log"),
-		*TraceName, *FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S")));
+	FString StandaloneLogPath = LogDir / FString::Printf(TEXT("%s_%s.log"), *TraceName, *RunStamp);
 	GLastLogFilePath = StandaloneLogPath;
 
 	FString ExtraArgs = FString::Printf(
-		TEXT("-tracehost=127.0.0.1 -trace=%s -tracefile=\"%s\" -abslog=\"%s\""),
+		TEXT("-trace=%s -tracefile=\"%s\" -abslog=\"%s\""),
 		*ChannelSet, *TracePath, *StandaloneLogPath);
 
 	FRequestPlaySessionParams P;
@@ -1237,8 +1286,10 @@ FString UBoundHoundService::StopStandalone()
 
 	GStandaloneRunning = false;
 
-	FString UTSTrace = FindLatestUTSTrace();
-	if (!UTSTrace.IsEmpty()) GLastTraceFilePath = UTSTrace;
+	// The standalone wrote its trace to the exact file StartStandalone named (-tracefile, issue #24).
+	// No "newest trace in the store" guess -- that picks up unrelated traces.
+	IFileManager& FM = IFileManager::Get();
+	const bool bTraceExists = !GLastTraceFilePath.IsEmpty() && FM.FileExists(*GLastTraceFilePath);
 
 	// GLastLogFilePath was set to a dedicated timestamped file in StartStandalone (-abslog), so it is
 	// already the standalone's own log -- no need to guess the newest log in the folder (which would
@@ -1247,8 +1298,16 @@ FString UBoundHoundService::StopStandalone()
 	TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
 	R->SetStringField(TEXT("status"),     TEXT("standalone stop requested"));
 	R->SetStringField(TEXT("trace_file"), GLastTraceFilePath);
+	R->SetBoolField(TEXT("trace_file_exists"), bTraceExists);
+	if (bTraceExists)
+	{
+		R->SetNumberField(TEXT("file_size_mb"), FMath::RoundToDouble((double)FM.FileSize(*GLastTraceFilePath) / (1024.0 * 1024.0) * 10.0) / 10.0);
+	}
+	else
+	{
+		R->SetStringField(TEXT("trace_warning"), TEXT("No trace was written at trace_file. The standalone may have failed to launch, exited before tracing started, or been launched with a -tracehost override."));
+	}
 	R->SetStringField(TEXT("log_file"),   GLastLogFilePath);
-	R->SetStringField(TEXT("uts_store"),  GetUTSStoreDir());
 	R->SetStringField(TEXT("hint"),       TEXT("Allow a few seconds for the trace file to finalise, then call Analyse."));
 	return OkJson(R);
 }
@@ -1265,7 +1324,9 @@ FString UBoundHoundService::GetStandaloneStatus()
 FString UBoundHoundService::StartPIE()
 {
 	if (!GEditor) return ErrJson(TEXT("NO_EDITOR"), TEXT("GEditor not available."));
-	if (IsPIERunning()) return ErrJson(TEXT("ALREADY_RUNNING"), TEXT("PIE is already running. Call StopPIE first."));
+	if (IsPIERunning() && !GEditor->ShouldEndPlayMap()) return ErrJson(TEXT("ALREADY_RUNNING"), TEXT("PIE is already running. Call StopPIE first."));
+	const FString Busy = PlaySessionBusyReason();
+	if (!Busy.IsEmpty()) return PlaySessionBusyError(Busy);
 
 	FRequestPlaySessionParams P;
 	P.SessionDestination = EPlaySessionDestinationType::InProcess;   // in-process, unlike StartStandalone's NewProcess

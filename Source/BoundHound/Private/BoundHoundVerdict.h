@@ -110,4 +110,45 @@ namespace BoundHoundVerdict
 		if (Mode == TEXT("rhi"))    return bRhiHit    && PeakRhiMs > PeakRenderMs && PeakRhiMs > PeakGameMs;
 		return false; // gpu / unknown -- not self-validated by induced CPU peaks
 	}
+
+	// Issue #27: FrameTiming reads the most recently completed frame's globals. While a caller (e.g. one
+	// Python call) holds the game thread, no new frame completes, so back-to-back reads return the SAME
+	// frame. A read is a repeat iff a previous read exists and the engine frame counter hasn't advanced.
+	inline bool IsRepeatRead(bool bHasPrevious, uint64 FrameNumber, uint64 PreviousFrameNumber)
+	{
+		return bHasPrevious && FrameNumber == PreviousFrameNumber;
+	}
+
+	// Issue #23: PIE's first seconds are dominated by shader/PSO compiles and streaming, so a single frame
+	// read then is not representative. Settled once the PIE world has run SETTLE_SECONDS of real time.
+	static constexpr double SETTLE_SECONDS = 10.0;
+	inline bool IsWarming(double PieRealSeconds)
+	{
+		return PieRealSeconds >= 0.0 && PieRealSeconds < SETTLE_SECONDS;
+	}
+
+	// Issue #23: describe Ms relative to RefMs as a human ratio. "~0x" for 13 vs 70.6 was unreadable; this
+	// says "5.4x faster than" / "2.0x slower than" / "about the same as" (within 10%). Empty when either
+	// value is missing, so the caller can drop the comparison entirely.
+	inline FString DescribeRatio(double Ms, double RefMs)
+	{
+		if (Ms <= 0.0 || RefMs <= 0.0) return FString();
+		const double R = Ms / RefMs;
+		if (R >= 0.9 && R <= 1.1) return TEXT("about the same as");
+		return R < 1.0
+			? FString::Printf(TEXT("%.1f× faster than"), 1.0 / R)
+			: FString::Printf(TEXT("%.1f× slower than"), R);
+	}
+
+	// Issue #28: starting a play session while another is running, queued or still ending queues a
+	// RequestPlaySession on top of the teardown and crashes the editor (TOptional IsSet assert). Returns
+	// why the editor is busy, or empty when it's safe to start a new session. Pure so it's testable.
+	inline FString PlaySessionBusyReason(bool bEndQueued, bool bRequestQueued, bool bPlayWorld, bool bSessionInProgress)
+	{
+		if (bEndQueued)         return TEXT("a play session is still ending (end-play queued for next tick)");
+		if (bRequestQueued)     return TEXT("a play session request is already queued for next tick");
+		if (bPlayWorld)         return TEXT("PIE is running");
+		if (bSessionInProgress) return TEXT("a play session is in progress");
+		return FString();
+	}
 }
