@@ -120,8 +120,7 @@ static FString BoundHint(const FString& Bound); // defined with FrameTiming belo
 // ---------------------------------------------------------------------------
 
 static constexpr double LOAD_FRAME_MS = 5000.0;  // a frame this long is loading, not gameplay
-static constexpr double SPIKE_FACTOR = 3.0;      // spike = this many times the median frame...
-static constexpr double SPIKE_FLOOR_MS = 33.3;   // ...and at least a dropped 30 fps frame
+static constexpr int32  MAX_SPIKE_FRAMES = 10;  // spike events explained one by one (issue #31)
 static constexpr double LOG_WINDOW_S = 0.05;     // log lines this close to a frame belong to it
 static constexpr int32  MAX_SCOPES = 5;
 static constexpr int32  MAX_LOG_LINES = 8;
@@ -148,7 +147,9 @@ public:
 
 	bool HasScopes() const { return bHasGameTimeline; }
 
-	void Explain(double Start, double End, const TSharedPtr<FJsonObject>& Out) const
+	// CsvEvents: names from the CSV's EVENTS column at this frame (issue #31). They count as evidence: the CSV
+	// names GC even when the trace has no CollectGarbage scope.
+	void Explain(double Start, double End, const TSharedPtr<FJsonObject>& Out, const TArray<FString>& CsvEvents = {}) const
 	{
 		TArray<FString> ScopeNames;
 		if (bHasGameTimeline)
@@ -189,7 +190,18 @@ public:
 			});
 		}
 
-		const TArray<BoundHoundDrilldown::FCause> Causes = BoundHoundDrilldown::ClassifyCauses(Lines, ScopeNames);
+		TArray<FString> Evidence = Lines;
+		if (CsvEvents.Num() > 0)
+		{
+			TArray<TSharedPtr<FJsonValue>> EvArr;
+			for (const FString& E : CsvEvents)
+			{
+				Evidence.Add(FString::Printf(TEXT("CSVEvent \"%s\""), *E));
+				EvArr.Add(MakeShared<FJsonValueString>(E));
+			}
+			Out->SetArrayField(TEXT("csv_events"), EvArr);
+		}
+		const TArray<BoundHoundDrilldown::FCause> Causes = BoundHoundDrilldown::ClassifyCauses(Evidence, ScopeNames);
 		TArray<TSharedPtr<FJsonValue>> CauseArr;
 		for (const BoundHoundDrilldown::FCause& C : Causes)
 		{
@@ -238,7 +250,30 @@ static FString CsvPathForTrace(const FString& TraceFile)
 	return FPaths::GetPath(TraceFile) / TEXT("CSV") / (FPaths::GetBaseFilename(TraceFile) + TEXT(".csv"));
 }
 
-static void AddThreadSplit(const FString& TraceFile, const TSharedPtr<FJsonObject>& Root)
+// What the trace analysis needs back from the CSV (issue #31): the samples (frame times, for the cap check
+// and the alignment with the trace), the EVENTS column, and the verdict's per-thread medians.
+struct FCsvCapture
+{
+	bool bOk = false;
+	TArray<BoundHoundVerdict::FThreadSample> Samples;
+	BoundHoundVerdict::FCsvThreadColumns Cols;
+	TArray<BoundHoundVerdict::FCsvEvent> Events;
+	BoundHoundVerdict::FTraceVerdict T;
+
+	// The slowest thread's median and its name: the real per-frame work, whatever the frame time says.
+	double BottleneckMedianMs(FString* OutName = nullptr) const
+	{
+		struct { const TCHAR* Name; double Ms; } C[] = {
+			{ TEXT("GameThread"), T.Game.MedianMs }, { TEXT("RenderThread"), T.Render.MedianMs },
+			{ TEXT("RHIThread"), T.bRhiAvailable ? T.Rhi.MedianMs : 0.0 }, { TEXT("GPU"), T.bGpuAvailable ? T.Gpu.MedianMs : 0.0 } };
+		int32 Best = 0;
+		for (int32 i = 1; i < 4; ++i) if (C[i].Ms > C[Best].Ms) Best = i;
+		if (OutName) *OutName = C[Best].Name;
+		return C[Best].Ms;
+	}
+};
+
+static void AddThreadSplit(const FString& TraceFile, const TSharedPtr<FJsonObject>& Root, FCsvCapture& Cap)
 {
 	auto Round2 = [](double V) -> double { return FMath::RoundToDouble(V * 100.0) / 100.0; };
 	TSharedPtr<FJsonObject> Split = MakeShared<FJsonObject>();
@@ -266,15 +301,16 @@ static void AddThreadSplit(const FString& TraceFile, const TSharedPtr<FJsonObjec
 		return;
 	}
 
-	TArray<BoundHoundVerdict::FThreadSample> Samples;
-	BoundHoundVerdict::FCsvThreadColumns Cols;
-	if (!BoundHoundVerdict::ParseCsvThreadSamples(Content, Samples, Cols))
+	if (!BoundHoundVerdict::ParseCsvThreadSamples(Content, Cap.Samples, Cap.Cols, &Cap.Events))
 	{
 		Unavailable(TEXT("The CSV capture has no usable GameThreadTime / RenderThreadTime rows."));
 		return;
 	}
+	Content.Empty();
 
-	const BoundHoundVerdict::FTraceVerdict T = BoundHoundVerdict::ClassifyTrace(Samples);
+	Cap.T = BoundHoundVerdict::ClassifyTrace(Cap.Samples);
+	Cap.bOk = true;
+	const BoundHoundVerdict::FTraceVerdict& T = Cap.T;
 	auto ThreadObj = [&](const BoundHoundVerdict::FThreadStats& S)
 	{
 		TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
@@ -316,6 +352,29 @@ static void AddThreadSplit(const FString& TraceFile, const TSharedPtr<FJsonObjec
 		Hint += TEXT(" NOTE: no GPU timing was recorded, so a GPU bottleneck can't be ruled out.");
 	}
 	Root->SetStringField(TEXT("bound_hint"), Hint);
+}
+
+// Issue #31: the CSV's EVENTS column, summarised: each event name, how often it fired and when (seconds from
+// the capture's start). GC shows up here even when the trace has no CollectGarbage scope.
+static void AddCsvEventSummary(const FCsvCapture& Csv, const TSharedPtr<FJsonObject>& Root)
+{
+	if (!Csv.bOk || Csv.Events.IsEmpty()) return;
+	TMap<FString, TArray<double>> ByName;
+	for (const BoundHoundVerdict::FCsvEvent& E : Csv.Events) ByName.FindOrAdd(E.Name).Add(E.TimeS);
+	ByName.ValueSort([](const TArray<double>& A, const TArray<double>& B) { return A.Num() > B.Num(); });
+	TArray<TSharedPtr<FJsonValue>> Arr;
+	for (const TPair<FString, TArray<double>>& KV : ByName)
+	{
+		if (Arr.Num() >= 15) break;
+		TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetStringField(TEXT("name"), KV.Key);
+		O->SetNumberField(TEXT("count"), KV.Value.Num());
+		TArray<TSharedPtr<FJsonValue>> Times;
+		for (int32 i = 0; i < FMath::Min(KV.Value.Num(), 20); ++i) Times.Add(MakeShared<FJsonValueNumber>(FMath::RoundToDouble(KV.Value[i] * 10.0) / 10.0));
+		O->SetArrayField(TEXT("times_s"), Times);
+		Arr.Add(MakeShared<FJsonValueObject>(O));
+	}
+	Root->SetArrayField(TEXT("csv_events"), Arr);
 }
 
 // Analysing a long capture takes a while (a 1.3 GB, 4-minute trace runs past the 30 s MCP Python timeout),
@@ -398,6 +457,11 @@ static FString AnalyseTraceUncached(const FString& TraceFile)
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetStringField(TEXT("trace_file"), TraceFile);
 
+	// The CSV capture first: its frame times and events feed the spike analysis below (issue #31).
+	FCsvCapture Csv;
+	AddThreadSplit(TraceFile, Root, Csv);
+	AddCsvEventSummary(Csv, Root);
+
 	{
 		TraceServices::FAnalysisSessionReadScope Scope(*Session);
 		Root->SetNumberField(TEXT("duration_seconds"), Session->GetDurationSeconds());
@@ -465,6 +529,32 @@ static FString AnalyseTraceUncached(const FString& TraceFile)
 						if (!FMath::IsFinite(Ms) || Ms > 120000.0) return;
 						Entries.Add({ Ms, F.Index, F.StartTime, F.EndTime });
 					});
+
+				// Issue #31: line the CSV up with the trace's frames, so a trace frame can be matched with the CSV's
+				// EVENTS at that frame (GC, FlushAsyncLoading...).
+				int32 CsvOffset = INDEX_NONE;
+				if (Csv.bOk && Csv.Cols.bFrame)
+				{
+					TArray<double> TraceMsByIndex;
+					TraceMsByIndex.SetNumZeroed((int32)FMath::Min(FrameCount, (uint64)MAX_int32));
+					for (const FFrameEntry& E : Entries) if (E.Index < (uint64)TraceMsByIndex.Num()) TraceMsByIndex[(int32)E.Index] = E.Ms;
+					TArray<double> CsvMs;
+					CsvMs.Reserve(Csv.Samples.Num());
+					for (const BoundHoundVerdict::FThreadSample& S : Csv.Samples) CsvMs.Add(S.FrameMs);
+					double AlignErr = 0.0;
+					CsvOffset = BoundHoundDrilldown::AlignCsvToTrace(TraceMsByIndex, CsvMs, &AlignErr);
+					TSharedPtr<FJsonObject> AObj = MakeShared<FJsonObject>();
+					AObj->SetBoolField(TEXT("aligned"), CsvOffset != INDEX_NONE);
+					if (CsvOffset != INDEX_NONE) AObj->SetNumberField(TEXT("trace_frame_of_first_csv_row"), CsvOffset);
+					AObj->SetNumberField(TEXT("mean_error_ms"), FMath::RoundToDouble(AlignErr * 100.0) / 100.0);
+					Root->SetObjectField(TEXT("csv_alignment"), AObj);
+				}
+				auto CsvEventsAt = [&](uint64 FrameIndex) -> TArray<FString>
+				{
+					if (CsvOffset == INDEX_NONE || Csv.Events.IsEmpty()) return {};
+					return BoundHoundDrilldown::CsvEventsNear(Csv.Events, (int32)((int64)FrameIndex - CsvOffset));
+				};
+
 				Entries.Sort([](const FFrameEntry& A, const FFrameEntry& B) { return A.Ms > B.Ms; });
 
 				const FFrameExplainer Explainer(*Session);
@@ -476,7 +566,7 @@ static FString AnalyseTraceUncached(const FString& TraceFile)
 					FObj->SetNumberField(TEXT("ms"), FMath::RoundToFloat(Entries[i].Ms * 100.0f) / 100.0f);
 					FObj->SetNumberField(TEXT("timestamp"), Entries[i].StartTime);
 					FObj->SetStringField(TEXT("phase"), (Entries[i].Index == 0 || Entries[i].Ms > LOAD_FRAME_MS) ? TEXT("load") : TEXT("run"));
-					Explainer.Explain(Entries[i].StartTime, Entries[i].EndTime, FObj);
+					Explainer.Explain(Entries[i].StartTime, Entries[i].EndTime, FObj, CsvEventsAt(Entries[i].Index));
 					WorstArr.Add(MakeShared<FJsonValueObject>(FObj));
 				}
 				Root->SetArrayField(TEXT("worst_frames"), WorstArr);
@@ -485,12 +575,41 @@ static FString AnalyseTraceUncached(const FString& TraceFile)
 					Root->SetStringField(TEXT("drilldown_note"), TEXT("No game-thread CPU scopes in this trace (needs the 'cpu' channel), so worst frames carry log lines only."));
 				}
 
+				// Issue #31: a frame-rate cap (t.MaxFPS / VSync) pins the frame time, so frame stats measure the cap,
+				// not the game. Detected from the CSV: frames sit on one value well above the slowest thread.
+				BoundHoundVerdict::FFrameCap Cap;
+				FString BottleneckName;
+				double BottleneckMs = 0.0;
+				if (Csv.bOk)
+				{
+					BottleneckMs = Csv.BottleneckMedianMs(&BottleneckName);
+					TArray<double> FrameSeries;
+					if (Csv.Cols.bFrame) { FrameSeries.Reserve(Csv.Samples.Num()); for (const BoundHoundVerdict::FThreadSample& S : Csv.Samples) FrameSeries.Add(S.FrameMs); }
+					else FrameSeries = AllMs;
+					Cap = BoundHoundVerdict::DetectFrameCap(FrameSeries, BottleneckMs);
+					TSharedPtr<FJsonObject> CObj = MakeShared<FJsonObject>();
+					CObj->SetBoolField(TEXT("capped"), Cap.bCapped);
+					CObj->SetNumberField(TEXT("frame_median_ms"), FMath::RoundToDouble(Cap.FrameMedianMs * 100.0) / 100.0);
+					CObj->SetStringField(TEXT("bottleneck"), BottleneckName);
+					CObj->SetNumberField(TEXT("bottleneck_median_ms"), FMath::RoundToDouble(BottleneckMs * 100.0) / 100.0);
+					if (Cap.bCapped)
+					{
+						CObj->SetNumberField(TEXT("cap_fps"), Cap.CapFps);
+						CObj->SetNumberField(TEXT("cap_budget_ms"), FMath::RoundToDouble(Cap.BudgetMs * 100.0) / 100.0);
+						CObj->SetNumberField(TEXT("headroom_ms"), FMath::RoundToDouble(Cap.HeadroomMs * 100.0) / 100.0);
+						CObj->SetStringField(TEXT("note"), FString::Printf(
+							TEXT("Frame-rate capped at %d fps (t.MaxFPS, VSync or a frame-rate limit setting): avg_fps / p95_frame_ms measure the cap, not the game. The real work is the %s median, %.2f ms, leaving %.2f ms headroom in the %.2f ms cap budget (~%.0f fps of work). Uncap (t.MaxFPS 0, r.VSync 0) to measure the game's own frame rate."),
+							Cap.CapFps, *BottleneckName, BottleneckMs, Cap.HeadroomMs, Cap.BudgetMs, BottleneckMs > 0.0 ? 1000.0 / BottleneckMs : 0.0));
+					}
+					Root->SetObjectField(TEXT("frame_cap"), CObj);
+				}
+
 				// Periodic spikes (issue #25): run-phase frames well above the typical frame, merged into events,
 				// checked for a fixed interval -- e.g. GC every ~61 s, which is invisible frame by frame.
 				if (!AllMs.IsEmpty())
 				{
 					const double MedianMs = AllMs[AllMs.Num() / 2]; // AllMs was sorted above
-					const double SpikeMs = FMath::Max(SPIKE_FACTOR * MedianMs, SPIKE_FLOOR_MS);
+					const double SpikeMs = BoundHoundVerdict::SpikeThresholdMs(MedianMs, Cap, BottleneckMs);
 					TArray<double> SpikeTimes;
 					for (const FFrameEntry& E : Entries)
 					{
@@ -500,6 +619,40 @@ static FString AnalyseTraceUncached(const FString& TraceFile)
 					const BoundHoundDrilldown::FPeriodicity P = BoundHoundDrilldown::DetectPeriodicSpikes(Merged);
 					TSharedPtr<FJsonObject> PObj = MakeShared<FJsonObject>();
 					PObj->SetNumberField(TEXT("spike_threshold_ms"), FMath::RoundToDouble(SpikeMs * 100.0) / 100.0);
+					PObj->SetStringField(TEXT("spike_threshold_basis"), Cap.bCapped
+						? FString::Printf(TEXT("capped run: 3x the %s median, at least one dropped frame at the %d fps cap"), *BottleneckName, Cap.CapFps)
+						: FString(TEXT("3x the median frame, at least 33.3 ms")));
+
+					// Issue #31: explain each spike event's worst frame. The worst-frames list is usually all load
+					// frames, so a mid-run GC hitch would otherwise never be explained. Worst events first, then
+					// listed in time order.
+					TArray<const FFrameEntry*> EventWorst;
+					for (int32 m = 0; m < FMath::Min(Merged.Num(), 200); ++m)
+					{
+						for (const FFrameEntry& E : Entries) // sorted worst first
+						{
+							if (E.Index != 0 && E.Ms <= LOAD_FRAME_MS && E.Ms >= SpikeMs && E.StartTime >= Merged[m] && E.StartTime < Merged[m] + 1.0)
+							{
+								EventWorst.Add(&E);
+								break;
+							}
+						}
+					}
+					EventWorst.Sort([](const FFrameEntry& A, const FFrameEntry& B) { return A.Ms > B.Ms; });
+					if (EventWorst.Num() > MAX_SPIKE_FRAMES) EventWorst.SetNum(MAX_SPIKE_FRAMES);
+					EventWorst.Sort([](const FFrameEntry& A, const FFrameEntry& B) { return A.StartTime < B.StartTime; });
+					TArray<TSharedPtr<FJsonValue>> SpikeFrameArr;
+					for (const FFrameEntry* E : EventWorst)
+					{
+						TSharedPtr<FJsonObject> FObj = MakeShared<FJsonObject>();
+						FObj->SetNumberField(TEXT("frame"), (double)E->Index);
+						FObj->SetNumberField(TEXT("ms"), FMath::RoundToFloat(E->Ms * 100.0f) / 100.0f);
+						FObj->SetNumberField(TEXT("timestamp"), E->StartTime);
+						FObj->SetStringField(TEXT("phase"), TEXT("run"));
+						Explainer.Explain(E->StartTime, E->EndTime, FObj, CsvEventsAt(E->Index));
+						SpikeFrameArr.Add(MakeShared<FJsonValueObject>(FObj));
+					}
+					PObj->SetArrayField(TEXT("spike_frames"), SpikeFrameArr);
 					PObj->SetNumberField(TEXT("spike_events"), Merged.Num());
 					PObj->SetBoolField(TEXT("periodic"), P.bPeriodic);
 					if (P.bPeriodic)
@@ -520,7 +673,6 @@ static FString AnalyseTraceUncached(const FString& TraceFile)
 		}
 	}
 
-	AddThreadSplit(TraceFile, Root);
 	return OkJson(Root);
 }
 
@@ -1189,14 +1341,24 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 	const double PeriodicInterval = Num(Spikes, TEXT("interval_s"));
 	const FString PeriodicLikely = Str(Spikes, TEXT("likely"));
 	TMap<FString, TPair<FString, int32>> RunCauses; // cause -> (lever, frames)
+	// Issue #31: spike frames (one per spike event) count too, so a mid-run GC hitch is explained even when
+	// the worst-frames list is all load frames. A frame in both lists counts once.
+	TArray<TSharedPtr<FJsonValue>> ExplainedFrames;
 	{
-		const TArray<TSharedPtr<FJsonValue>>* WorstFrames = nullptr;
-		if (Trace.IsValid() && Trace->TryGetArrayField(TEXT("worst_frames"), WorstFrames) && WorstFrames)
+		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+		if (Trace.IsValid() && Trace->TryGetArrayField(TEXT("worst_frames"), Arr) && Arr) ExplainedFrames.Append(*Arr);
+		if (Spikes.IsValid() && Spikes->TryGetArrayField(TEXT("spike_frames"), Arr) && Arr) ExplainedFrames.Append(*Arr);
+	}
+	{
+		TSet<int32> Seen;
 		{
-			for (const TSharedPtr<FJsonValue>& V : *WorstFrames)
+			for (const TSharedPtr<FJsonValue>& V : ExplainedFrames)
 			{
 				const TSharedPtr<FJsonObject> WO = V->AsObject();
 				if (!WO.IsValid() || Str(WO, TEXT("phase")) != TEXT("run")) continue; // load causes fold into the startup fix
+				bool bAlready = false;
+				Seen.Add((int32)Num(WO, TEXT("frame")), &bAlready);
+				if (bAlready) continue;
 				const TArray<TSharedPtr<FJsonValue>>* CauseArr = nullptr;
 				if (!WO->TryGetArrayField(TEXT("causes"), CauseArr) || !CauseArr) continue;
 				for (const TSharedPtr<FJsonValue>& C : *CauseArr)
@@ -1208,6 +1370,18 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 			}
 		}
 	}
+
+	// Issue #31: a frame-rate-capped run. Its frame stats (avg fps, p95) measure the cap, not the game.
+	const TSharedPtr<FJsonObject> FrameCap = ObjField(Trace, TEXT("frame_cap"));
+	const bool bCapped = FrameCap.IsValid() && FrameCap->GetBoolField(TEXT("capped"));
+	const int32 CapFps = (int32)Num(FrameCap, TEXT("cap_fps"));
+	const double CapHeadroomMs = Num(FrameCap, TEXT("headroom_ms"));
+	const double CapBottleneckMs = Num(FrameCap, TEXT("bottleneck_median_ms"));
+	const FString CapBottleneck = Str(FrameCap, TEXT("bottleneck"));
+	const FString CapSentence = bCapped
+		? FString::Printf(TEXT("Capped at %d fps: frame stats show the cap. Headroom = %.1f ms (the %.1f ms budget minus the %s median, %.1f ms)."),
+			CapFps, CapHeadroomMs, Num(FrameCap, TEXT("cap_budget_ms")), *CapBottleneck, CapBottleneckMs)
+		: FString();
 
 	// Issue #22: a capture with per-thread frame times carries its own verdict (medians over the whole run).
 	// It describes the representative run, so it wins over the single in-process frame.
@@ -1288,7 +1462,7 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 		FString Label = C.Key.Replace(TEXT("_"), TEXT(" "));
 		if (!Label.IsEmpty()) Label[0] = FChar::ToUpper(Label[0]);
 		Fixes.Add({ FString::Printf(TEXT("%s in %d of the worst gameplay frames"), *Label, C.Value.Value),
-			TEXT("Found in the trace at the moment these frames spiked (log lines and the game thread's biggest scopes)."),
+			TEXT("Found at the moment these frames spiked: the trace's log lines and biggest game-thread scopes, and the CSV capture's events."),
 			C.Value.Key,
 			BoundHoundDocs::Insights, TEXT("Unreal Insights — UE 5.8 docs") });
 	}
@@ -1332,12 +1506,21 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 		}
 		H += FString::Printf(TEXT("<div class=\"tile crit\"><p class=\"k\">Worst frame (cold)</p><p class=\"v\">%s<small>ms</small></p><p class=\"s\">The frame-0 stall the warm reading hid.</p></div>"),
 			*FString::FormatAsNumber((int64)MaxFrameMs));
-		const FString RatioText = bInProcRepresentative ? BoundHoundVerdict::DescribeRatio(P95Ms, FrameMs) : FString();
-		const FString SteadySub = RatioText.IsEmpty()
-			? FString::Printf(TEXT("avg %.1f fps over the capture."), AvgFps)
-			: FString::Printf(TEXT("%s the %.1f ms in-process frame."), *RatioText, FrameMs);
-		H += FString::Printf(TEXT("<div class=\"tile %s\"><p class=\"k\">Steady-state (p95)</p><p class=\"v\">%.0f<small>ms</small></p><p class=\"s\">%s</p></div>"),
-			P95Ms > BudgetMs ? TEXT("crit") : TEXT("good"), P95Ms, *BHHtmlEscape(SteadySub));
+		if (bCapped)
+		{
+			// The p95 is the cap; the bottleneck's median is the game's real per-frame work.
+			H += FString::Printf(TEXT("<div class=\"tile %s\"><p class=\"k\">Real work (capped at %d fps)</p><p class=\"v\">%.1f<small>ms</small></p><p class=\"s\">%s Frame p95 %.0f ms.</p></div>"),
+				CapHeadroomMs < 0.0 ? TEXT("crit") : TEXT("good"), CapFps, CapBottleneckMs, *BHHtmlEscape(CapSentence), P95Ms);
+		}
+		else
+		{
+			const FString RatioText = bInProcRepresentative ? BoundHoundVerdict::DescribeRatio(P95Ms, FrameMs) : FString();
+			const FString SteadySub = RatioText.IsEmpty()
+				? FString::Printf(TEXT("avg %.1f fps over the capture."), AvgFps)
+				: FString::Printf(TEXT("%s the %.1f ms in-process frame."), *RatioText, FrameMs);
+			H += FString::Printf(TEXT("<div class=\"tile %s\"><p class=\"k\">Steady-state (p95)</p><p class=\"v\">%.0f<small>ms</small></p><p class=\"s\">%s</p></div>"),
+				P95Ms > BudgetMs ? TEXT("crit") : TEXT("good"), P95Ms, *BHHtmlEscape(SteadySub));
+		}
 	}
 	else
 	{
@@ -1375,8 +1558,11 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 		const FString WarmSteady = bInProcRepresentative
 			? FString::Printf(TEXT("<b>%.1f ms</b> &middot; %s &middot; %.0f fps"), FrameMs, *BHHtmlEscape(LiveBound.IsEmpty() ? TEXT("—") : LiveBound), Fps)
 			: FString::Printf(TEXT("<span class=\"tag warn\">not representative</span> %s"), *BHHtmlEscape(InProcCaveat));
-		H += FString::Printf(TEXT("<tr class=\"bound\"><td class=\"dim\">Steady-state frame<small>hot path</small></td><td class=\"warm\">%s</td><td class=\"cold\"><b>p95 %.0f ms</b> &middot; avg <b>%.1f fps</b> &middot; %d frames</td><td class=\"rec-cell\">%s</td></tr>"),
-			*WarmSteady, P95Ms, AvgFps, FrameCount, bVerdictUsable ? SteadyRec : TEXT("No usable bound verdict yet (see the fix list)"));
+		const FString CapCell = bCapped
+			? FString::Printf(TEXT(" <span class=\"tag warn\">capped %d fps</span><br>%s"), CapFps, *BHHtmlEscape(CapSentence))
+			: FString();
+		H += FString::Printf(TEXT("<tr class=\"bound\"><td class=\"dim\">Steady-state frame<small>hot path</small></td><td class=\"warm\">%s</td><td class=\"cold\"><b>p95 %.0f ms</b> &middot; avg <b>%.1f fps</b> &middot; %d frames%s</td><td class=\"rec-cell\">%s</td></tr>"),
+			*WarmSteady, P95Ms, AvgFps, FrameCount, *CapCell, bVerdictUsable ? SteadyRec : TEXT("No usable bound verdict yet (see the fix list)"));
 		const double CapRenderMed = Num(ObjField(Split, TEXT("render_thread")), TEXT("median_ms"));
 		H += FString::Printf(TEXT("<tr><td class=\"dim\">Render thread<small>attribution</small></td><td class=\"warm\">Reads <b>%.1f ms</b> in-process</td><td class=\"cold\">%s</td><td class=\"rec-cell\">Use a representative trace for render / RHI attribution — in-process render time is not shipping-accurate</td></tr>"),
 			RenderMs, *(bTraceVerdict ? FString::Printf(TEXT("Median <b>%.1f ms</b> over the run"), CapRenderMed) : FString(TEXT("Not recorded in this capture"))));
@@ -1446,18 +1632,37 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 	// Capture summary (trace worst frames + log health), when present
 	if (bHasTrace)
 	{
-		H += FString::Printf(TEXT("<h2>Representative capture &middot; %.0fs &middot; avg %.1f fps%s</h2>"), DurationS, AvgFps,
+		H += FString::Printf(TEXT("<h2>Representative capture &middot; %.0fs &middot; avg %.1f fps%s%s</h2>"), DurationS, AvgFps,
+			bCapped ? *FString::Printf(TEXT(" (capped at %d)"), CapFps) : TEXT(""),
 			RunResolution.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" &middot; %s"), *BHHtmlEscape(RunResolution)));
 		const TArray<TSharedPtr<FJsonValue>>* Worst = nullptr;
 		if (Trace->TryGetArrayField(TEXT("worst_frames"), Worst) && Worst)
 		{
 			// Each worst frame with what explains it (issue #25): its first recognised cause and biggest scope.
-			H += TEXT("<div class=\"card\"><ul class=\"worst\">");
-			int32 Shown = 0;
+			// Then the spike frames (issue #31): mid-run hitches that the load frames push out of the worst list.
+			TArray<TSharedPtr<FJsonObject>> ListFrames;
+			TSet<int32> Listed;
 			for (const TSharedPtr<FJsonValue>& V : *Worst)
 			{
 				const TSharedPtr<FJsonObject> WO = V->AsObject();
-				if (!WO.IsValid()) continue;
+				if (!WO.IsValid() || ListFrames.Num() >= 6) continue;
+				ListFrames.Add(WO); Listed.Add((int32)Num(WO, TEXT("frame")));
+			}
+			const TArray<TSharedPtr<FJsonValue>>* SpikeFrames = nullptr;
+			int32 SpikeShown = 0;
+			if (Spikes.IsValid() && Spikes->TryGetArrayField(TEXT("spike_frames"), SpikeFrames) && SpikeFrames)
+			{
+				for (const TSharedPtr<FJsonValue>& V : *SpikeFrames)
+				{
+					const TSharedPtr<FJsonObject> WO = V->AsObject();
+					if (!WO.IsValid() || Listed.Contains((int32)Num(WO, TEXT("frame"))) || SpikeShown >= 4) continue;
+					WO->SetBoolField(TEXT("_spike"), true);
+					ListFrames.Add(WO); ++SpikeShown;
+				}
+			}
+			H += TEXT("<div class=\"card\"><ul class=\"worst\">");
+			for (const TSharedPtr<FJsonObject>& WO : ListFrames)
+			{
 				FString Why;
 				const TArray<TSharedPtr<FJsonValue>>* CauseArr = nullptr;
 				if (WO->TryGetArrayField(TEXT("causes"), CauseArr) && CauseArr && CauseArr->Num() > 0)
@@ -1470,12 +1675,13 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 					const TSharedPtr<FJsonObject> S0 = (*ScopeArr)[0]->AsObject();
 					Why += FString::Printf(TEXT("%s%s %.0f ms"), Why.IsEmpty() ? TEXT("") : TEXT(" · "), *Str(S0, TEXT("scope")), Num(S0, TEXT("self_ms")));
 				}
+				const bool bSpike = WO->HasField(TEXT("_spike"));
 				H += FString::Printf(TEXT("<li><span class=\"fm\">frame %d%s</span><span class=\"why\">%s</span><span>%s ms</span></li>"),
 					(int32)WO->GetNumberField(TEXT("frame")),
-					Str(WO, TEXT("phase")) == TEXT("load") ? TEXT(" &middot; load") : TEXT(""),
+					Str(WO, TEXT("phase")) == TEXT("load") ? TEXT(" &middot; load")
+						: bSpike ? *FString::Printf(TEXT(" &middot; spike @ %.0f s"), Num(WO, TEXT("timestamp"))) : TEXT(""),
 					*BHHtmlEscape(Why),
 					*FString::FormatAsNumber((int64)WO->GetNumberField(TEXT("ms"))));
-				if (++Shown >= 6) break;
 			}
 			H += TEXT("</ul></div>");
 		}

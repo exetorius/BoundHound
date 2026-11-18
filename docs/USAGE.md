@@ -231,10 +231,38 @@ least 33 ms) are merged into events and checked for a fixed beat. A burst of unr
 hide it:
 
 ```jsonc
-"spikes": { "spike_threshold_ms": 34.04, "spike_events": 8, "periodic": true, "interval_s": 61.1,
+"spikes": { "spike_threshold_ms": 34.04, "spike_threshold_basis": "3x the median frame, at least 33.3 ms",
+            "spike_events": 8, "periodic": true, "interval_s": 61.1,
             "matching_spikes": 3, "likely": "garbage collection: matches gc.TimeBetweenPurgingPendingKillObjects (default 61.1 s)",
-            "spike_times_s": [52.4, 70.6, 71.7, 72.7, 73.7, 78, 139.1, 200.2] }
+            "spike_times_s": [52.4, 70.6, 71.7, 72.7, 73.7, 78, 139.1, 200.2],
+            "spike_frames": [ /* the worst frame of each spike event, explained like worst_frames */ ] }
 ```
+
+`spikes.spike_frames` explains one frame per spike event (up to 10, in time order). The worst-frames
+list is usually all load frames, so a mid-run hitch, such as a GC every 61 s, is explained here instead.
+
+### Frame-capped runs (v1.2.0)
+
+With `t.MaxFPS`, VSync or a frame-rate limit setting, every frame waits for the cap, so `avg_fps` and
+`p95_frame_ms` measure the cap, not the game. `analyse()` detects this from the CSV: the frames sit
+tightly on one value well above the slowest thread's median. (The CSV's `targetframerate` metadata can't
+tell: the engine fills it from the display's refresh rate, so uncapped runs report it too.)
+
+```jsonc
+"frame_cap": { "capped": true, "cap_fps": 60, "cap_budget_ms": 16.67, "frame_median_ms": 16.67,
+               "bottleneck": "GPU", "bottleneck_median_ms": 9.75, "headroom_ms": 6.92,
+               "note": "Frame-rate capped at 60 fps ... Uncap (t.MaxFPS 0, r.VSync 0) to measure the game's own frame rate." }
+```
+
+- In a capped run the spike threshold is 3× the **bottleneck's** median, but at least one dropped frame
+  at the cap (1.9× the cap's budget). Otherwise a 33 ms GC hitch in a 60-capped run never counts: 3× a
+  16.7 ms median is 50 ms.
+- `csv_events` lists the CSV's own `EVENTS` column (`GC`, `FlushAsyncLoading`, ...) with counts and
+  times. Each explained frame gets the events recorded at that frame (`csv_events`) and they count as
+  evidence for `causes`, so GC is named even when the trace has no `CollectGarbage` scope.
+  `csv_alignment` says how the CSV's rows were matched to the trace's frames (by their frame times).
+- `report()` says the run was capped and shows the bottleneck's median and the headroom in place of the
+  steady-state p95.
 
 On the log side, `notable_lines` start once frames are running (config, plugin, font and other
 startup lines are skipped; `startup_lines_skipped` counts them), and `run_display` gives the resolution

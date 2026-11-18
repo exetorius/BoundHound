@@ -765,4 +765,116 @@ bool FBoundHoundDisplayArgsTest::RunTest(const FString&)
 	return true;
 }
 
+// ---------------------------------------------------------------------------
+// Frame-capped runs (issue #31)
+// ---------------------------------------------------------------------------
+
+// The CSV's FrameTime and EVENTS columns: "Name##seconds" entries, several per cell separated by ';'.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundCsvEventsTest,
+	"BoundHound.FrameCap.CsvEvents", kBHTestFlags)
+bool FBoundHoundCsvEventsTest::RunTest(const FString&)
+{
+	using namespace BoundHoundVerdict;
+	const FString Csv =
+		TEXT("EVENTS,FrameTime,RenderThreadTime,GameThreadTime,GPUTime\n")
+		TEXT(",16.67,7.8,4.5,9.7\n")
+		TEXT("GC##58.621448,16.67,7.8,33.4,9.7\n")
+		TEXT("FlushAsyncLoading##58.643;Foo##58.65,33.37,7.8,7.3,9.7\n")
+		TEXT(",16.67,7.8,4.5,9.7\n");
+	TArray<FThreadSample> S; FCsvThreadColumns Cols; TArray<FCsvEvent> Ev;
+	TestTrue (TEXT("parses"), ParseCsvThreadSamples(Csv, S, Cols, &Ev));
+	TestTrue (TEXT("FrameTime column found"), Cols.bFrame);
+	TestEqual(TEXT("4 samples"), S.Num(), 4);
+	if (S.Num() == 4) TestEqual(TEXT("frame time read"), S[2].FrameMs, 33.37);
+	TestEqual(TEXT("3 events"), Ev.Num(), 3);
+	if (Ev.Num() == 3)
+	{
+		TestEqual(TEXT("GC name"), Ev[0].Name, FString(TEXT("GC")));
+		TestEqual(TEXT("GC on sample 1"), Ev[0].Sample, 1);
+		TestTrue (TEXT("GC time"), FMath::IsNearlyEqual(Ev[0].TimeS, 58.621448, 1e-6));
+		TestEqual(TEXT("two events in one cell"), Ev[2].Name, FString(TEXT("Foo")));
+		TestEqual(TEXT("second on sample 2"), Ev[2].Sample, 2);
+	}
+
+	// The frame-time spike lands a row after the GC event: looking one row either side finds it.
+	const TArray<FString> Near = BoundHoundDrilldown::CsvEventsNear(Ev, 2);
+	TestTrue(TEXT("GC found from the spike row"), Near.Contains(TEXT("GC")) && Near.Contains(TEXT("FlushAsyncLoading")));
+	TestEqual(TEXT("nothing near sample 0 -> only GC (radius 1)"), BoundHoundDrilldown::CsvEventsNear(Ev, 0).Num(), 1);
+
+	// A CSV event is evidence for the cause classifier, as the Explain path feeds it.
+	auto HasCause = [](const TArray<BoundHoundDrilldown::FCause>& C, const TCHAR* Tag) { for (const auto& X : C) if (X.Tag == Tag) return true; return false; };
+	TestTrue(TEXT("CSV GC event -> garbage_collection"), HasCause(BoundHoundDrilldown::ClassifyCauses({ TEXT("CSVEvent \"GC\"") }, {}), TEXT("garbage_collection")));
+	TestTrue(TEXT("CSV FlushAsyncLoading event -> sync_load"), HasCause(BoundHoundDrilldown::ClassifyCauses({ TEXT("CSVEvent \"FlushAsyncLoading\"") }, {}), TEXT("sync_load")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundFrameCapTest,
+	"BoundHound.FrameCap.Detect", kBHTestFlags)
+bool FBoundHoundFrameCapTest::RunTest(const FString&)
+{
+	using namespace BoundHoundVerdict;
+	// The field report: t.MaxFPS 60, frames pinned at 16.667 ms, GPU median 9.75 ms.
+	TArray<double> Capped;
+	for (int32 i = 0; i < 600; ++i) Capped.Add(16.6668 + ((i % 5) - 2) * 0.001);
+	Capped[300] = 33.37; Capped[500] = 33.83; // the two GC frames
+	const FFrameCap C = DetectFrameCap(Capped, 9.75);
+	TestTrue (TEXT("capped detected"), C.bCapped);
+	TestEqual(TEXT("cap 60 fps"), C.CapFps, 60);
+	TestTrue (TEXT("headroom ~6.9 ms"), FMath::IsNearlyEqual(C.HeadroomMs, 16.6667 - 9.75, 0.01));
+
+	// The spike threshold must catch a 33 ms frame in a 60-capped run (3x the capped median = 50 ms didn't).
+	const double Th = SpikeThresholdMs(C.FrameMedianMs, C, 9.75);
+	TestTrue(TEXT("capped threshold below a dropped frame"), Th < 33.3 && Th > 16.7 * 1.5);
+
+	// Uncapped (the Proteus runs): frame ~= the slowest thread, wide spread.
+	TArray<double> Free;
+	for (int32 i = 0; i < 600; ++i) Free.Add(11.3 + ((i * 7) % 11 - 5) * 0.35);
+	const FFrameCap U = DetectFrameCap(Free, 11.2);
+	TestFalse(TEXT("uncapped not flagged"), U.bCapped);
+	TestTrue (TEXT("uncapped threshold unchanged (33.3 floor)"), FMath::IsNearlyEqual(SpikeThresholdMs(10.0, U, 9.8), 33.3, 0.001));
+	TestTrue (TEXT("uncapped threshold 3x median"), FMath::IsNearlyEqual(SpikeThresholdMs(20.0, U, 19.0), 60.0, 0.001));
+
+	// Pinned at 16.67 because the bottleneck itself takes ~16 ms: that's the game, not a cap.
+	TestFalse(TEXT("bottleneck fills the frame -> not capped"), DetectFrameCap(Capped, 15.9).bCapped);
+
+	// Big gap but frames all over the place: not a cap.
+	TArray<double> Noisy;
+	for (int32 i = 0; i < 600; ++i) Noisy.Add(20.0 + (i % 9) * 2.0);
+	TestFalse(TEXT("wide spread -> not capped"), DetectFrameCap(Noisy, 9.0).bCapped);
+
+	TestFalse(TEXT("too few frames"), DetectFrameCap({ 16.67, 16.67 }, 9.0).bCapped);
+	TestFalse(TEXT("no bottleneck reading"), DetectFrameCap(Capped, 0.0).bCapped);
+
+	// A 30 fps cap: a dropped frame is ~66 ms.
+	TArray<double> Thirty; for (int32 i = 0; i < 100; ++i) Thirty.Add(33.333);
+	const FFrameCap C30 = DetectFrameCap(Thirty, 12.0);
+	TestEqual(TEXT("cap 30 fps"), C30.CapFps, 30);
+	TestTrue (TEXT("30-cap threshold ~1.9x budget"), FMath::IsNearlyEqual(SpikeThresholdMs(C30.FrameMedianMs, C30, 12.0), 63.33, 0.05));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundCsvAlignTest,
+	"BoundHound.FrameCap.AlignCsvToTrace", kBHTestFlags)
+bool FBoundHoundCsvAlignTest::RunTest(const FString&)
+{
+	using namespace BoundHoundDrilldown;
+	// The CSV starts a few frames after the trace; the opening load frames pin the offset even though the rest
+	// of the run is capped flat.
+	TArray<double> Csv = { 2480.8, 110.1, 89.2, 1304.9, 45.0, 30.2 };
+	for (int32 i = 0; i < 700; ++i) Csv.Add(16.667 + (i % 3) * 0.002);
+	TArray<double> Trace = { 37000.0, 900.0, 15.0, 40.0, 22.0 }; // 5 frames before the CSV starts
+	for (double V : Csv) Trace.Add(V + 0.01);                    // same frames, slightly different timing
+	double Err = 0.0;
+	TestEqual(TEXT("offset 5"), AlignCsvToTrace(Trace, Csv, &Err), 5);
+	TestTrue (TEXT("small error"), Err < 0.05);
+
+	// Unrelated sequences don't align.
+	TArray<double> Other;
+	for (int32 i = 0; i < 800; ++i) Other.Add(5.0 + (i % 13) * 3.0);
+	TestEqual(TEXT("no match -> INDEX_NONE"), AlignCsvToTrace(Other, Csv), (int32)INDEX_NONE);
+
+	TestEqual(TEXT("too short -> INDEX_NONE"), AlignCsvToTrace(Trace, { 1.0, 2.0 }), (int32)INDEX_NONE);
+	return true;
+}
+
 #endif // WITH_AUTOMATION_TESTS
