@@ -7,6 +7,7 @@
 #include "BoundHoundVerdict.h"
 #include "BoundHoundDrilldown.h"
 #include "BoundHoundBaseline.h"
+#include "BoundHoundMemory.h"
 #include "BoundHoundService.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -238,7 +239,7 @@ bool FBoundHoundFrameTimingShapeTest::RunTest(const FString&)
 	for (const TCHAR* Field : { TEXT("game_thread_ms"), TEXT("render_thread_ms"), TEXT("rhi_thread_ms"),
 		TEXT("gpu_ms"), TEXT("frame_ms"), TEXT("fps"), TEXT("bound"), TEXT("bound_confidence"),
 		TEXT("margin_ms"), TEXT("contested"), TEXT("hint"), TEXT("pie_running"),
-		TEXT("frame_number"), TEXT("timestamp"), TEXT("repeat_read"), TEXT("warming") })
+		TEXT("frame_number"), TEXT("timestamp"), TEXT("repeat_read"), TEXT("warming"), TEXT("memory") })
 	{
 		TestTrue(FString::Printf(TEXT("has field %s"), Field), Obj->HasField(Field));
 	}
@@ -1015,6 +1016,86 @@ bool FBoundHoundBaselineIdentityTest::RunTest(const FString&)
 	TestEqual(TEXT("round trip: metrics"), Back.Metrics.Num(), S.Metrics.Num());
 	TestTrue (TEXT("round trip: compares equal"), Compare(S, Back, false).Mismatches.IsEmpty());
 	TestFalse(TEXT("not a baseline -> false"), FromJson(MakeShared<FJsonObject>(), Back));
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Memory / VRAM (issue #8)
+// ---------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundMemoryPressureTest,
+	"BoundHound.Memory.Pressure", kBHTestFlags)
+bool FBoundHoundMemoryPressureTest::RunTest(const FString&)
+{
+	using namespace BoundHoundMemory;
+	auto Tags = [](const TArray<FPressure>& P) { TArray<FString> T; for (const FPressure& X : P) T.Add(X.Tag); return T; };
+
+	FMemReading Ok;
+	Ok.TotalPhysicalMB = 32768; Ok.AvailablePhysicalMB = 16000; Ok.ProcessUsedMB = 6000;
+	Ok.bVramValid = true; Ok.VramBudgetMB = 11000; Ok.VramUsedMB = 6000;
+	Ok.bStreamingValid = true; Ok.PoolMB = 1000; Ok.RequiredPoolMB = 800;
+	TestEqual(TEXT("healthy: no issues"), ClassifyMemory(Ok).Num(), 0);
+	TestEqual(TEXT("healthy: pressure none"), OverallPressure(ClassifyMemory(Ok)), FString(TEXT("none")));
+
+	FMemReading Demoted = Ok; Demoted.VramUsedMB = 11200; Demoted.VramDemotedMB = 350;
+	const TArray<FPressure> D = ClassifyMemory(Demoted);
+	TestTrue (TEXT("demoted -> vram_over_budget"), Tags(D).Contains(TEXT("vram_over_budget")));
+	TestFalse(TEXT("demoted isn't also reported as near budget"), Tags(D).Contains(TEXT("vram_near_budget")));
+	TestEqual(TEXT("demoted -> critical"), OverallPressure(D), FString(TEXT("critical")));
+
+	FMemReading Near = Ok; Near.VramUsedMB = 10200; // 93%
+	TestTrue (TEXT("93% -> vram_near_budget"), Tags(ClassifyMemory(Near)).Contains(TEXT("vram_near_budget")));
+	TestEqual(TEXT("near -> warn"), OverallPressure(ClassifyMemory(Near)), FString(TEXT("warn")));
+
+	FMemReading Pool = Ok; Pool.OverBudgetMB = 240; Pool.RequiredPoolMB = 1240;
+	TestTrue(TEXT("streaming over budget"), Tags(ClassifyMemory(Pool)).Contains(TEXT("streaming_over_budget")));
+
+	FMemReading Low = Ok; Low.AvailablePhysicalMB = 2500; // < 10% of 32 GB
+	const TArray<FPressure> L = ClassifyMemory(Low);
+	TestTrue (TEXT("low RAM flagged"), Tags(L).Contains(TEXT("system_memory_low")));
+	TestEqual(TEXT("low RAM -> warn"), OverallPressure(L), FString(TEXT("warn")));
+	FMemReading Paging = Ok; Paging.AvailablePhysicalMB = 900; // < 5% of 32 GB
+	TestEqual(TEXT("very low RAM -> critical"), OverallPressure(ClassifyMemory(Paging)), FString(TEXT("critical")));
+
+	FMemReading NoVram = Ok; NoVram.bVramValid = false; NoVram.VramDemotedMB = 999; // not reported -> not judged
+	TestEqual(TEXT("no VRAM reading -> no VRAM issue"), ClassifyMemory(NoVram).Num(), 0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundMemorySeriesTest,
+	"BoundHound.Memory.OverRun", kBHTestFlags)
+bool FBoundHoundMemorySeriesTest::RunTest(const FString&)
+{
+	using namespace BoundHoundMemory;
+	// A load ramp, then flat: no growth flag (the load is excluded).
+	TArray<double> Flat;
+	for (int32 i = 0; i < 1000; ++i) Flat.Add(i < 100 ? 2000.0 + i * 40.0 : 6000.0 + (i % 7));
+	const FSeries F = SummariseSeries(Flat);
+	TestTrue (TEXT("flat: valid"), F.bValid);
+	TestTrue (TEXT("flat: peak"), FMath::IsNearlyEqual(F.Peak, 6006.0));
+	TestTrue (TEXT("flat: ~0 growth"), FMath::Abs(F.GrowthMB) < 10.0);
+	TestFalse(TEXT("flat: not notable"), IsNotableGrowth(F));
+
+	// Steady climb through gameplay: 6000 -> 7000 MB.
+	TArray<double> Leak;
+	for (int32 i = 0; i < 1000; ++i) Leak.Add(6000.0 + i);
+	const FSeries G = SummariseSeries(Leak);
+	TestTrue(TEXT("leak: growth ~650 MB"), G.GrowthMB > 600.0 && G.GrowthMB < 700.0);
+	TestTrue(TEXT("leak: notable"), IsNotableGrowth(G));
+
+	TestFalse(TEXT("too few samples"), SummariseSeries({ 1.0, 2.0 }).bValid);
+
+	// Columns read in one pass, same row rules as the thread parser.
+	const FString Csv =
+		TEXT("EVENTS,FrameTime,PhysicalUsedMB,MemoryFreeMB\n")
+		TEXT(",16.6,6000,20000\n")
+		TEXT(",16.6,6010,19990\n")
+		TEXT("[HasHeaderRowAtEnd],1\n")
+		TEXT(",16.6,6020");
+	const TMap<FString, TArray<double>> C = ParseCsvColumns(Csv, { TEXT("PhysicalUsedMB"), TEXT("MemoryFreeMB"), TEXT("Missing") });
+	TestEqual(TEXT("2 rows of used"), C.FindRef(TEXT("PhysicalUsedMB")).Num(), 2);
+	TestTrue (TEXT("free read"), C.Contains(TEXT("MemoryFreeMB")) && C[TEXT("MemoryFreeMB")][1] == 19990.0);
+	TestFalse(TEXT("missing column absent"), C.Contains(TEXT("Missing")));
 	return true;
 }
 

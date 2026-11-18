@@ -23,6 +23,7 @@ from Python with no C++ required. Run everything here from the editor's Python c
 > Stopping PIE only *requests* the end; the teardown happens on the next engine tick. So stop the
 > session, end your Python call / MCP request so the engine can tick, and start the next session in a
 > new call. (Before v1.0.1, starting a standalone in the same call as a PIE stop crashed the editor.)
+| `mem_stats()` | Memory / VRAM reading + pressure verdict. See [Memory and VRAM](#-memory-and-vram). |
 | `save_baseline(name="default", scenario="", source="capture", file="")` | Save a run as a named baseline in `Saved/BoundHound/baselines/<name>.json`. See [Baseline + diff](#-baseline--diff). |
 | `compare_baseline(name="default", source="capture", file="", force=False)` | Compare a run against a saved baseline: factual deltas, what changed beyond noise, verdict change. |
 | `list_baselines()` | The saved baselines (name, kind, scenario, created, verdict, map). |
@@ -284,6 +285,37 @@ which never sends the stat names to Unreal Insights, so in a `.utrace` they're o
 > **90 s+** before stopping if you want steady-state numbers. A shorter capture is still fine for
 > *demonstrating* the startup hitch (it's exactly what a warm PIE run hides), just not for hot-path
 > averages.
+
+## 🧠 Memory and VRAM
+
+The bound verdict covers compute. A frame can also stutter for memory reasons: VRAM over budget (the
+driver demotes resources to system memory and the GPU reads them over PCIe), a texture streaming pool too
+small for the view, or a machine that's paging. `mem_stats()` reads all three:
+
+```jsonc
+{
+  "system": { "total_physical_mb": 32690, "available_physical_mb": 9289, "process_used_mb": 6273, "process_peak_mb": 9039 },
+  "vram": { "available": true, "budget_mb": 11228, "used_mb": 1672, "used_pct": 14.9, "demoted_mb": 0,
+            "dedicated_video_mb": 11996, "streaming_textures_mb": 181, "non_streaming_textures_mb": 803 },
+  "texture_streaming": { "available": true, "pool_mb": 1000, "required_mb": 9, "over_budget_mb": 0 },
+  "pressure": "none",            // "warn" | "critical"
+  "issues": [],                  // each { issue, severity, why, lever }
+  "hint": "No memory pressure: ..."
+}
+```
+
+- **Issues:** `vram_over_budget` (anything demoted: critical), `vram_near_budget` (90%+ of the budget),
+  `streaming_over_budget` (the pool can't hold the wanted mips: blurry textures, mip churn),
+  `system_memory_low` (under 10% / 1 GB free; under 5% / 512 MB is critical).
+- The VRAM budget is the OS/driver's (DXGI on D3D12). RHIs that don't report one give
+  `vram.available: false`, and VRAM isn't judged.
+- `frame_timing()` includes a one-line `memory` object (`pressure`, process and VRAM MB, `issues`), so
+  obvious pressure shows up on the first call.
+- **It reads the editor process.** PIE runs inside the editor, so the process and VRAM numbers include
+  it. For the game alone, capture a standalone run: `analyse()` adds `memory_over_run` from the run's
+  CSV: the game process's peak and median, `growth_mb` from early in the run (25-35% in, past the
+  load) to the end, `notable_growth` (200 MB+ and 5%+), and the lowest free system RAM. `report()`
+  shows it and lists growth as a fix.
 
 ## 📏 Baseline + diff
 

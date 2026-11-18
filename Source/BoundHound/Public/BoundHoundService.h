@@ -189,6 +189,15 @@ public:
 	static FString CompareBaseline(const FString& Name = TEXT("default"), const FString& Source = TEXT("capture"),
 	                               const FString& File = TEXT(""), bool bForce = false);
 
+	/**
+	 * Memory / VRAM reading to go with the compute verdict: system RAM and this process, VRAM used vs the
+	 * OS/driver budget (and anything demoted to system memory), the texture streaming pool, and a pressure
+	 * verdict ("none" / "warn" / "critical") with an issue + lever for each problem found. Reads the editor
+	 * process (PIE included); for the game alone use a standalone capture (analyse() memory_over_run).
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "BoundHound|Performance")
+	static FString MemStats();
+
 	/** List the saved baselines: name, kind, scenario, created, verdict. */
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "BoundHound|Performance")
 	static FString ListBaselines();

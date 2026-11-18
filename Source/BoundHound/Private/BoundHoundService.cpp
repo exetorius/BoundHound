@@ -4,6 +4,10 @@
 #include "BoundHoundVerdict.h"
 #include "BoundHoundDrilldown.h"
 #include "BoundHoundBaseline.h"
+#include "BoundHoundMemory.h"
+#include "ContentStreaming.h"   // texture streaming pool (issue #8)
+#include "RHIStats.h"          // FRHIMemoryStats / FTextureMemoryStats
+#include "DynamicRHI.h"        // RHIGetMemoryStats
 #include "Misc/EngineVersion.h"
 #include "Json.h"
 #include "Misc/Paths.h"
@@ -307,6 +311,32 @@ static void AddThreadSplit(const FString& TraceFile, const TSharedPtr<FJsonObjec
 	{
 		Unavailable(TEXT("The CSV capture has no usable GameThreadTime / RenderThreadTime rows."));
 		return;
+	}
+	// Issue #8: the game process's memory over the run (the CSV profiler records it every frame).
+	{
+		const TMap<FString, TArray<double>> MemCols = BoundHoundMemory::ParseCsvColumns(Content, { TEXT("PhysicalUsedMB"), TEXT("MemoryFreeMB") });
+		const TArray<double>* Used = MemCols.Find(TEXT("PhysicalUsedMB"));
+		const TArray<double>* Free = MemCols.Find(TEXT("MemoryFreeMB"));
+		const BoundHoundMemory::FSeries U = Used ? BoundHoundMemory::SummariseSeries(*Used) : BoundHoundMemory::FSeries();
+		const BoundHoundMemory::FSeries F = Free ? BoundHoundMemory::SummariseSeries(*Free) : BoundHoundMemory::FSeries();
+		if (U.bValid || F.bValid)
+		{
+			TSharedPtr<FJsonObject> M = MakeShared<FJsonObject>();
+			if (U.bValid)
+			{
+				M->SetNumberField(TEXT("process_used_peak_mb"), FMath::RoundToDouble(U.Peak));
+				M->SetNumberField(TEXT("process_used_median_mb"), FMath::RoundToDouble(U.Median));
+				M->SetNumberField(TEXT("process_used_early_mb"), FMath::RoundToDouble(U.EarlyMB));
+				M->SetNumberField(TEXT("process_used_late_mb"), FMath::RoundToDouble(U.LateMB));
+				M->SetNumberField(TEXT("growth_mb"), FMath::RoundToDouble(U.GrowthMB));
+				M->SetBoolField(TEXT("notable_growth"), BoundHoundMemory::IsNotableGrowth(U));
+			}
+			if (F.bValid) M->SetNumberField(TEXT("system_free_min_mb"), FMath::RoundToDouble(F.Min));
+			M->SetStringField(TEXT("note"), BoundHoundMemory::IsNotableGrowth(U)
+				? FString::Printf(TEXT("The game's memory grew %.0f MB from early in the run (25-35%% in) to the end. Steady growth through gameplay points at a leak or an unbounded cache: compare 'memreport -full' at two points, or run with -llm."), U.GrowthMB)
+				: FString(TEXT("The game process's memory over the captured run (CSV PhysicalUsedMB / MemoryFreeMB). growth_mb = end of run minus early run (25-35% in, past the load).")));
+			Root->SetObjectField(TEXT("memory_over_run"), M);
+		}
 	}
 	Content.Empty();
 
@@ -845,6 +875,46 @@ static FString BoundHint(const FString& Bound)
 	return TEXT("CPU game-thread bound. Usual cause: Tick / Blueprint / AI / animation cost. Run 'stat dumpframe -ms=0.5 -root=gamethread' on the PIE world then read the result. Levers: throttle/disable unnecessary Tick, reduce ticking actors & AI, cut expensive Blueprint tick logic. NOTE: dropping r.ScreenPercentage will NOT help a game-thread-bound frame.");
 }
 
+// ---------------------------------------------------------------------------
+// Memory / VRAM (issue #8)
+// ---------------------------------------------------------------------------
+
+static constexpr double BYTES_PER_MB = 1024.0 * 1024.0;
+
+// This process's memory, the machine's RAM, VRAM against the OS/driver budget, and the texture streaming pool.
+static BoundHoundMemory::FMemReading ReadMemory()
+{
+	BoundHoundMemory::FMemReading R;
+	const FPlatformMemoryStats Mem = FPlatformMemory::GetStats();
+	R.TotalPhysicalMB = FPlatformMemory::GetConstants().TotalPhysical / BYTES_PER_MB;
+	R.AvailablePhysicalMB = Mem.AvailablePhysical / BYTES_PER_MB;
+	R.ProcessUsedMB = Mem.UsedPhysical / BYTES_PER_MB;
+	R.ProcessPeakMB = Mem.PeakUsedPhysical / BYTES_PER_MB;
+	if (GDynamicRHI)
+	{
+		FRHIMemoryStats V;
+		RHIGetMemoryStats(V);
+		if (V.IsValid())
+		{
+			R.bVramValid = true;
+			R.VramBudgetMB = V.BudgetLocal / BYTES_PER_MB;
+			R.VramUsedMB = V.UsedLocal / BYTES_PER_MB;
+			R.VramDemotedMB = V.DemotedLocal / BYTES_PER_MB;
+		}
+	}
+	if (IStreamingManager::Get().IsTextureStreamingEnabled())
+	{
+		const IRenderAssetStreamingManager& TS = IStreamingManager::Get().GetTextureStreamingManager();
+		R.bStreamingValid = TS.GetPoolSize() > 0;
+		R.PoolMB = TS.GetPoolSize() / BYTES_PER_MB;
+		R.RequiredPoolMB = TS.GetRequiredPoolSize() / BYTES_PER_MB;
+		R.OverBudgetMB = FMath::Max<int64>(TS.GetMemoryOverBudget(), 0) / BYTES_PER_MB;
+	}
+	return R;
+}
+
+static double RoundMB(double V) { return FMath::RoundToDouble(V); }
+
 FString UBoundHoundService::FrameTiming(float TargetFPS)
 {
 	const double GameMs   = FPlatformTime::ToMilliseconds(GGameThreadTime);
@@ -986,6 +1056,26 @@ FString UBoundHoundService::FrameTiming(float TargetFPS)
 	if (GpuMs <= 0.0)
 	{
 		R->SetStringField(TEXT("gpu_note"), TEXT("gpu_ms is 0 (GPU timing unavailable this frame) -- rely on the game vs render comparison, and confirm GPU-bound with the r.ScreenPercentage 50 test."));
+	}
+
+	// Issue #8: a one-line memory check next to the compute verdict, so obvious memory pressure shows up
+	// on the first call. MemStats has the full reading.
+	{
+		const BoundHoundMemory::FMemReading Mem = ReadMemory();
+		const TArray<BoundHoundMemory::FPressure> Pressure = BoundHoundMemory::ClassifyMemory(Mem);
+		TSharedPtr<FJsonObject> M = MakeShared<FJsonObject>();
+		M->SetStringField(TEXT("pressure"), BoundHoundMemory::OverallPressure(Pressure));
+		M->SetNumberField(TEXT("process_used_mb"), RoundMB(Mem.ProcessUsedMB));
+		if (Mem.bVramValid)
+		{
+			M->SetNumberField(TEXT("vram_used_mb"), RoundMB(Mem.VramUsedMB));
+			M->SetNumberField(TEXT("vram_budget_mb"), RoundMB(Mem.VramBudgetMB));
+		}
+		TArray<TSharedPtr<FJsonValue>> Tags;
+		for (const BoundHoundMemory::FPressure& P : Pressure) Tags.Add(MakeShared<FJsonValueString>(P.Tag));
+		M->SetArrayField(TEXT("issues"), Tags);
+		if (Pressure.Num() > 0) M->SetStringField(TEXT("hint"), Pressure[0].Why + TEXT(" Call mem_stats() for the full reading."));
+		R->SetObjectField(TEXT("memory"), M);
 	}
 	return OkJson(R);
 }
@@ -1483,6 +1573,23 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 			C.Value.Key,
 			BoundHoundDocs::Insights, TEXT("Unreal Insights — UE 5.8 docs") });
 	}
+	// Issue #8: memory. Growth through the captured run (the game alone), and pressure in this process.
+	const TSharedPtr<FJsonObject> MemRun = ObjField(Trace, TEXT("memory_over_run"));
+	if (MemRun.IsValid() && MemRun->GetBoolField(TEXT("notable_growth")))
+	{
+		Fixes.Add({ FString::Printf(TEXT("Memory grew %.0f MB during the run"), Num(MemRun, TEXT("growth_mb"))),
+			Str(MemRun, TEXT("note")),
+			TEXT("memreport -full\n# ...play on, then again, and diff the two reports\n# or launch with -llm and read the LLM CSV / 'stat llmfull'"),
+			BoundHoundDocs::Profiling, TEXT("Performance Profiling — UE 5.8 docs") });
+	}
+	const TSharedPtr<FJsonObject> LiveMem = ObjField(FT, TEXT("memory"));
+	if (LiveMem.IsValid() && Str(LiveMem, TEXT("pressure")) != TEXT("none") && !Str(LiveMem, TEXT("pressure")).IsEmpty())
+	{
+		Fixes.Add({ TEXT("Memory pressure in this process"),
+			Str(LiveMem, TEXT("hint")) + TEXT(" (Read from the editor process, PIE included: confirm in a standalone run.)"),
+			TEXT("stat RHI\nstat streaming\nmemreport -full"),
+			BoundHoundDocs::Profiling, TEXT("Performance Profiling — UE 5.8 docs") });
+	}
 	if (bHasLogs && PsoHitches > 0)
 	{
 		Fixes.Add({ FString::Printf(TEXT("%d PSO hitch%s — pipeline-state cache misses"), PsoHitches, PsoHitches == 1 ? TEXT("") : TEXT("es")),
@@ -1706,6 +1813,12 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 		{
 			H += FString::Printf(TEXT("<p class=\"lede\" style=\"margin-top:14px\"><b style=\"color:var(--ink)\">Periodic spikes:</b> %d spikes about every %.1f s%s.</p>"),
 				PeriodicCount, PeriodicInterval, PeriodicLikely.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" &mdash; %s"), *BHHtmlEscape(PeriodicLikely)));
+		}
+		if (MemRun.IsValid() && MemRun->HasField(TEXT("process_used_peak_mb")))
+		{
+			H += FString::Printf(TEXT("<p class=\"lede\" style=\"margin-top:14px\"><b style=\"color:var(--ink)\">Memory:</b> game process peak %s MB, %+.0f MB from early run to the end%s.</p>"),
+				*FString::FormatAsNumber((int64)Num(MemRun, TEXT("process_used_peak_mb"))), Num(MemRun, TEXT("growth_mb")),
+				MemRun->HasField(TEXT("system_free_min_mb")) ? *FString::Printf(TEXT(", system RAM free at least %s MB"), *FString::FormatAsNumber((int64)Num(MemRun, TEXT("system_free_min_mb")))) : TEXT(""));
 		}
 		if (bHasLogs)
 		{
@@ -2338,5 +2451,70 @@ FString UBoundHoundService::ListBaselines()
 	TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
 	R->SetStringField(TEXT("dir"), BaselineDir());
 	R->SetArrayField(TEXT("baselines"), Arr);
+	return OkJson(R);
+}
+
+FString UBoundHoundService::MemStats()
+{
+	const BoundHoundMemory::FMemReading M = ReadMemory();
+	const TArray<BoundHoundMemory::FPressure> Pressure = BoundHoundMemory::ClassifyMemory(M);
+
+	TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+	TSharedPtr<FJsonObject> Sys = MakeShared<FJsonObject>();
+	Sys->SetNumberField(TEXT("total_physical_mb"), RoundMB(M.TotalPhysicalMB));
+	Sys->SetNumberField(TEXT("available_physical_mb"), RoundMB(M.AvailablePhysicalMB));
+	Sys->SetNumberField(TEXT("process_used_mb"), RoundMB(M.ProcessUsedMB));
+	Sys->SetNumberField(TEXT("process_peak_mb"), RoundMB(M.ProcessPeakMB));
+	R->SetObjectField(TEXT("system"), Sys);
+
+	TSharedPtr<FJsonObject> Vram = MakeShared<FJsonObject>();
+	Vram->SetBoolField(TEXT("available"), M.bVramValid);
+	if (M.bVramValid)
+	{
+		Vram->SetNumberField(TEXT("budget_mb"), RoundMB(M.VramBudgetMB));
+		Vram->SetNumberField(TEXT("used_mb"), RoundMB(M.VramUsedMB));
+		Vram->SetNumberField(TEXT("used_pct"), M.VramBudgetMB > 0.0 ? FMath::RoundToDouble(M.VramUsedMB / M.VramBudgetMB * 1000.0) / 10.0 : 0.0);
+		Vram->SetNumberField(TEXT("demoted_mb"), RoundMB(M.VramDemotedMB));
+	}
+	else
+	{
+		Vram->SetStringField(TEXT("note"), TEXT("This RHI doesn't report a VRAM budget (D3D12 does; the null RHI and some others don't)."));
+	}
+	if (GDynamicRHI)
+	{
+		FTextureMemoryStats T;
+		RHIGetTextureMemoryStats(T);
+		if (T.DedicatedVideoMemory > 0) Vram->SetNumberField(TEXT("dedicated_video_mb"), RoundMB(T.DedicatedVideoMemory / BYTES_PER_MB));
+		Vram->SetNumberField(TEXT("streaming_textures_mb"), RoundMB(T.StreamingMemorySize / BYTES_PER_MB));
+		Vram->SetNumberField(TEXT("non_streaming_textures_mb"), RoundMB(T.NonStreamingMemorySize / BYTES_PER_MB));
+	}
+	R->SetObjectField(TEXT("vram"), Vram);
+
+	TSharedPtr<FJsonObject> Stream = MakeShared<FJsonObject>();
+	Stream->SetBoolField(TEXT("available"), M.bStreamingValid);
+	if (M.bStreamingValid)
+	{
+		Stream->SetNumberField(TEXT("pool_mb"), RoundMB(M.PoolMB));
+		Stream->SetNumberField(TEXT("required_mb"), RoundMB(M.RequiredPoolMB));
+		Stream->SetNumberField(TEXT("over_budget_mb"), RoundMB(M.OverBudgetMB));
+	}
+	R->SetObjectField(TEXT("texture_streaming"), Stream);
+
+	TArray<TSharedPtr<FJsonValue>> Arr;
+	for (const BoundHoundMemory::FPressure& P : Pressure)
+	{
+		TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetStringField(TEXT("issue"), P.Tag);
+		O->SetStringField(TEXT("severity"), P.Severity);
+		O->SetStringField(TEXT("why"), P.Why);
+		O->SetStringField(TEXT("lever"), P.Lever);
+		Arr.Add(MakeShared<FJsonValueObject>(O));
+	}
+	R->SetStringField(TEXT("pressure"), BoundHoundMemory::OverallPressure(Pressure));
+	R->SetArrayField(TEXT("issues"), Arr);
+	R->SetStringField(TEXT("hint"), Pressure.Num() > 0
+		? Pressure[0].Why
+		: FString(TEXT("No memory pressure: VRAM within budget, the streaming pool fits, and system RAM has room.")));
+	R->SetStringField(TEXT("note"), TEXT("This reads the EDITOR process (PIE runs inside it), so process and VRAM numbers include the editor. For the game alone, capture a standalone run: analyse() returns memory_over_run from its CSV."));
 	return OkJson(R);
 }
