@@ -33,6 +33,7 @@ DEFINE_LOG_CATEGORY_STATIC(LogBoundHound, Log, All);
 
 static FString GLastTraceFilePath;
 static FString GLastLogFilePath;
+static FString GLastCsvFilePath;
 static bool           GStandaloneRunning = false;
 static FProcHandle    GStandaloneProcess;
 static FDelegateHandle GStandalonePlayDelegateHandle;
@@ -107,6 +108,98 @@ static FString BuildTraceFilePath(const FString& Name)
 // ---------------------------------------------------------------------------
 // Trace analysis
 // ---------------------------------------------------------------------------
+
+static FString BoundHint(const FString& Bound); // defined with FrameTiming below
+
+// Issue #22: per-thread split + CPU-vs-GPU verdict for a captured run. StartStandalone runs a CSV-profiler
+// capture alongside the trace and names it after the trace: <Saved>/Profiling/<base>.utrace pairs with
+// <Saved>/Profiling/CSV/<base>.csv. The CSV holds GameThreadTime / RenderThreadTime / RHIThreadTime / GPUTime
+// for every frame (the same globals FrameTiming reads). See BoundHoundVerdict::ParseCsvThreadSamples for why
+// this comes from the CSV and not the trace.
+static FString CsvPathForTrace(const FString& TraceFile)
+{
+	return FPaths::GetPath(TraceFile) / TEXT("CSV") / (FPaths::GetBaseFilename(TraceFile) + TEXT(".csv"));
+}
+
+static void AddThreadSplit(const FString& TraceFile, const TSharedPtr<FJsonObject>& Root)
+{
+	auto Round2 = [](double V) -> double { return FMath::RoundToDouble(V * 100.0) / 100.0; };
+	TSharedPtr<FJsonObject> Split = MakeShared<FJsonObject>();
+	const FString CsvFile = CsvPathForTrace(TraceFile);
+	Split->SetStringField(TEXT("csv_file"), CsvFile);
+
+	auto Unavailable = [&](const FString& Why)
+	{
+		Split->SetBoolField(TEXT("available"), false);
+		Split->SetStringField(TEXT("note"), Why + TEXT(" Per-thread times come from the CSV-profiler file StartStandalone (v1.1.0+) writes next to its trace. Traces from StartTrace in the editor, or older standalone runs, have whole-frame stats only."));
+		Root->SetObjectField(TEXT("thread_split"), Split);
+	};
+
+	FString Content;
+	if (!FPaths::FileExists(CsvFile))
+	{
+		Unavailable(FPaths::FileExists(CsvFile + TEXT(".gz"))
+			? FString(TEXT("The CSV capture is compressed (.csv.gz), which BoundHound can't read; set csv.CompressionMode 0."))
+			: FString(TEXT("No CSV capture found for this trace.")));
+		return;
+	}
+	if (!FFileHelper::LoadFileToString(Content, *CsvFile))
+	{
+		Unavailable(TEXT("The CSV capture exists but couldn't be read (still open by the game?)."));
+		return;
+	}
+
+	TArray<BoundHoundVerdict::FThreadSample> Samples;
+	BoundHoundVerdict::FCsvThreadColumns Cols;
+	if (!BoundHoundVerdict::ParseCsvThreadSamples(Content, Samples, Cols))
+	{
+		Unavailable(TEXT("The CSV capture has no usable GameThreadTime / RenderThreadTime rows."));
+		return;
+	}
+
+	const BoundHoundVerdict::FTraceVerdict T = BoundHoundVerdict::ClassifyTrace(Samples);
+	auto ThreadObj = [&](const BoundHoundVerdict::FThreadStats& S)
+	{
+		TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetNumberField(TEXT("avg_ms"), Round2(S.AvgMs));
+		O->SetNumberField(TEXT("median_ms"), Round2(S.MedianMs));
+		O->SetNumberField(TEXT("p95_ms"), Round2(S.P95Ms));
+		return O;
+	};
+	Split->SetBoolField(TEXT("available"), true);
+	Split->SetNumberField(TEXT("frames"), T.SampleCount);
+	Split->SetObjectField(TEXT("game_thread"), ThreadObj(T.Game));
+	Split->SetObjectField(TEXT("render_thread"), ThreadObj(T.Render));
+	if (T.bRhiAvailable) Split->SetObjectField(TEXT("rhi_thread"), ThreadObj(T.Rhi));
+	if (T.bGpuAvailable) Split->SetObjectField(TEXT("gpu"), ThreadObj(T.Gpu));
+	Root->SetObjectField(TEXT("thread_split"), Split);
+
+	// The verdict, with the same fields and rules as FrameTiming, but from the per-thread medians.
+	Root->SetStringField(TEXT("bound"), T.Verdict.Bound);
+	Root->SetStringField(TEXT("bound_confidence"), T.Verdict.Confidence);
+	Root->SetNumberField(TEXT("margin_ms"), Round2(T.Verdict.MarginMs));
+	Root->SetBoolField(TEXT("contested"), T.Verdict.bContested);
+	if (T.Verdict.bContested && !T.Verdict.RunnerName.IsEmpty()) Root->SetStringField(TEXT("contested_with"), T.Verdict.RunnerName);
+
+	TSharedPtr<FJsonObject> Share = MakeShared<FJsonObject>();
+	Share->SetNumberField(TEXT("GameThread"), Round2(T.ShareGame));
+	Share->SetNumberField(TEXT("RenderThread"), Round2(T.ShareRender));
+	if (T.bRhiAvailable) Share->SetNumberField(TEXT("RHIThread"), Round2(T.ShareRhi));
+	if (T.bGpuAvailable) Share->SetNumberField(TEXT("GPU"), Round2(T.ShareGpu));
+	Root->SetObjectField(TEXT("bound_share"), Share);
+
+	FString Hint = FString::Printf(TEXT("Verdict from the per-thread MEDIANS of %d captured frames (%s was the slowest thread in %.0f%% of them). %s"),
+		T.SampleCount, *T.Verdict.Bound, T.WinnerShare * 100.0, *BoundHint(T.Verdict.Bound));
+	if (T.WinnerShare < BoundHoundVerdict::MIN_WINNER_SHARE)
+	{
+		Hint = FString::Printf(TEXT("ALTERNATING: the slowest thread changes from frame to frame (see bound_share), so treat the top threads as joint bottlenecks. %s"), *Hint);
+	}
+	else if (!T.bGpuAvailable && T.Verdict.Bound != TEXT("GPU"))
+	{
+		Hint += TEXT(" NOTE: no GPU timing was recorded, so a GPU bottleneck can't be ruled out.");
+	}
+	Root->SetStringField(TEXT("bound_hint"), Hint);
+}
 
 static FString AnalyseTrace(const FString& TraceFile)
 {
@@ -219,6 +312,7 @@ static FString AnalyseTrace(const FString& TraceFile)
 		}
 	}
 
+	AddThreadSplit(TraceFile, Root);
 	return OkJson(Root);
 }
 
@@ -788,6 +882,8 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 	{ double V = D; if (O.IsValid()) { O->TryGetNumberField(K, V); } return V; };
 	auto Str = [](const TSharedPtr<FJsonObject>& O, const TCHAR* K) -> FString
 	{ FString V; if (O.IsValid()) { O->TryGetStringField(K, V); } return V; };
+	auto ObjField = [](const TSharedPtr<FJsonObject>& O, const TCHAR* K) -> TSharedPtr<FJsonObject>
+	{ const TSharedPtr<FJsonObject>* P = nullptr; if (O.IsValid()) { O->TryGetObjectField(K, P); } return P ? *P : TSharedPtr<FJsonObject>(); };
 
 	// --- Gather: live verdict + budget, and the capture summary (best-effort) --------------------------
 	const TSharedPtr<FJsonObject> FT = Deserialize(FrameTiming(60.0f));
@@ -812,8 +908,8 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 	const double GpuMs    = Num(FT, TEXT("gpu_ms"));
 	const double FrameMs  = Num(FT, TEXT("frame_ms"));
 	const double Fps      = Num(FT, TEXT("fps"));
-	const FString Bound   = Str(FT, TEXT("bound"));
-	const FString Conf    = Str(FT, TEXT("bound_confidence"));
+	const FString LiveBound = Str(FT, TEXT("bound"));
+	const FString LiveConf  = Str(FT, TEXT("bound_confidence"));
 	const double BudgetMs = Num(Budget, TEXT("budget_ms"), 16.67);
 	const double TargetFps= Num(Budget, TEXT("target_fps"), 60.0);
 	const bool bMeets     = Budget.IsValid() && Budget->GetBoolField(TEXT("meets_target"));
@@ -842,6 +938,15 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 	const int32 LogErrors  = (int32)Num(Logs, TEXT("errors"));
 	const int32 LogWarnings= (int32)Num(Logs, TEXT("warnings"));
 
+	// Issue #22: a capture with per-thread frame times carries its own verdict (medians over the whole run).
+	// It describes the representative run, so it wins over the single in-process frame.
+	const TSharedPtr<FJsonObject> Split = ObjField(Trace, TEXT("thread_split"));
+	const FString TraceBound = Str(Trace, TEXT("bound"));
+	const bool bTraceVerdict = bHasTrace && !TraceBound.IsEmpty();
+	const FString Bound = bTraceVerdict ? TraceBound : LiveBound;
+	const FString Conf  = bTraceVerdict ? Str(Trace, TEXT("bound_confidence")) : LiveConf;
+	const TCHAR* BoundSource = bTraceVerdict ? TEXT("trace") : (bInProcRepresentative ? TEXT("in_process") : TEXT("none"));
+
 	// --- Build the "fix in this order" list from the data ---------------------------------------------
 	TArray<FBHFix> Fixes;
 	if (bHasTrace && MaxFrameMs > 250.0)
@@ -852,15 +957,17 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 			TEXT("# Ship a bundled PSO cache + keep precaching on (default):\nr.PSOPrecache.GlobalShaders 1\n# Then async-stream the opening level so the first frame isn't a hard stall."),
 			BoundHoundDocs::PsoPrecache, TEXT("PSO Precaching — UE 5.8 docs") });
 	}
-	// Only a fresh, settled PIE frame gets to drive the bound fix. A warming-up or repeated frame is noise
-	// (issue #23: a PIE start-up frame got the run labelled GPU-bound), and an editor-viewport frame measures
-	// the editor, not the game. Instead, tell the reader how to get a usable verdict.
-	const bool bVerdictUsable = bInProcRepresentative;
+	// The bound fix comes from the capture's verdict when there is one (issue #22), else from a fresh, settled
+	// PIE frame. A warming-up or repeated frame is noise (issue #23: a PIE start-up frame got the run labelled
+	// GPU-bound), and an editor-viewport frame measures the editor, not the game. Instead, say how to get one.
+	const bool bVerdictUsable = bTraceVerdict || bInProcRepresentative;
 	if (!bVerdictUsable)
 	{
 		Fixes.Add({ TEXT("Get a usable CPU-vs-GPU verdict first"),
-			FString::Printf(TEXT("The in-process frame isn't representative (%s), so this report doesn't say which thread bounds your game."), *InProcCaveat),
-			TEXT("# In separate calls, so frames can advance between them:\nstart_pie()\n# ...wait ~10 s for PIE to settle, park in a representative spot...\nframe_timing()\nreport(...)"),
+			bHasTrace
+				? FString::Printf(TEXT("This capture has no per-thread frame times, and the in-process frame isn't representative (%s), so this report doesn't say which thread bounds your game."), *InProcCaveat)
+				: FString::Printf(TEXT("The in-process frame isn't representative (%s), so this report doesn't say which thread bounds your game."), *InProcCaveat),
+			TEXT("# Best: capture a standalone run (records per-thread times):\nstart_standalone(\"name\", \"\")\n# ...play ~2 min past the load...\nstop_standalone()\nreport(...)\n# Quick: in separate calls, start_pie(), wait ~10 s, then report(...)"),
 			BoundHoundDocs::Profiling, TEXT("Performance Profiling — UE 5.8 docs") });
 	}
 	else if (Bound == TEXT("GameThread"))
@@ -922,7 +1029,7 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 		if (bInProcRepresentative)
 		{
 			H += FString::Printf(TEXT("<div class=\"tile warn\"><p class=\"k\">In-process (warm)</p><p class=\"v\">%.1f<small>ms</small></p><p class=\"s\">%.0f fps &middot; %s &middot; budget %s</p></div>"),
-				FrameMs, Fps, *BHHtmlEscape(Bound.IsEmpty() ? TEXT("—") : Bound), bMeets ? TEXT("PASS") : TEXT("FAIL"));
+				FrameMs, Fps, *BHHtmlEscape(LiveBound.IsEmpty() ? TEXT("—") : LiveBound), bMeets ? TEXT("PASS") : TEXT("FAIL"));
 		}
 		else
 		{
@@ -972,19 +1079,56 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 		H += FString::Printf(TEXT("<tr><td class=\"dim\">PSO hitches<small>pipeline stalls</small></td><td class=\"warm\">Not surfaced</td><td class=\"cold\"><b>%d</b> from <code>-logPSO</code>%s</td><td class=\"rec-cell\">Bundle a gathered PSO cache with the build — folds into the startup fix</td></tr>"),
 			PsoHitches, PsoHitches > 0 ? TEXT(" <span class=\"tag warn\">hitch</span>") : TEXT(""));
 		const FString WarmSteady = bInProcRepresentative
-			? FString::Printf(TEXT("<b>%.1f ms</b> &middot; %s &middot; %.0f fps"), FrameMs, *BHHtmlEscape(Bound.IsEmpty() ? TEXT("—") : Bound), Fps)
+			? FString::Printf(TEXT("<b>%.1f ms</b> &middot; %s &middot; %.0f fps"), FrameMs, *BHHtmlEscape(LiveBound.IsEmpty() ? TEXT("—") : LiveBound), Fps)
 			: FString::Printf(TEXT("<span class=\"tag warn\">not representative</span> %s"), *BHHtmlEscape(InProcCaveat));
 		H += FString::Printf(TEXT("<tr class=\"bound\"><td class=\"dim\">Steady-state frame<small>hot path</small></td><td class=\"warm\">%s</td><td class=\"cold\"><b>p95 %.0f ms</b> &middot; avg <b>%.1f fps</b> &middot; %d frames</td><td class=\"rec-cell\">%s</td></tr>"),
-			*WarmSteady, P95Ms, AvgFps, FrameCount, bVerdictUsable ? SteadyRec : TEXT("Take an in-process reading in settled PIE for the bound verdict (see the fix list)"));
-		H += FString::Printf(TEXT("<tr><td class=\"dim\">Render thread<small>attribution</small></td><td class=\"warm\">Reads <b>%.1f ms</b> in-process</td><td class=\"cold\">Captured per-frame in the trace</td><td class=\"rec-cell\">Use a representative trace for render / RHI attribution — in-process render time is not shipping-accurate</td></tr>"),
-			RenderMs);
-		H += TEXT("<tr><td class=\"dim\">Bound verdict<small>CPU vs GPU</small></td><td class=\"warm\">Live — <code>FrameTiming</code> / <code>ForceHitch</code> self-measure</td><td class=\"cold\">Read via trace + <code>Analyse</code></td><td class=\"rec-cell\">In-process for the fast verdict + hitch self-validation; representative for <i>where</i> the ms goes</td></tr>");
+			*WarmSteady, P95Ms, AvgFps, FrameCount, bVerdictUsable ? SteadyRec : TEXT("No usable bound verdict yet (see the fix list)"));
+		const double CapRenderMed = Num(ObjField(Split, TEXT("render_thread")), TEXT("median_ms"));
+		H += FString::Printf(TEXT("<tr><td class=\"dim\">Render thread<small>attribution</small></td><td class=\"warm\">Reads <b>%.1f ms</b> in-process</td><td class=\"cold\">%s</td><td class=\"rec-cell\">Use a representative trace for render / RHI attribution — in-process render time is not shipping-accurate</td></tr>"),
+			RenderMs, *(bTraceVerdict ? FString::Printf(TEXT("Median <b>%.1f ms</b> over the run"), CapRenderMed) : FString(TEXT("Not recorded in this capture"))));
+		const FString LiveVerdictCell = bInProcRepresentative
+			? FString::Printf(TEXT("<b>%s</b> &middot; %s"), *BHHtmlEscape(LiveBound), *BHHtmlEscape(LiveConf))
+			: FString::Printf(TEXT("<span class=\"tag warn\">n/a</span> %s"), *BHHtmlEscape(InProcCaveat));
+		const FString TraceVerdictCell = bTraceVerdict
+			? FString::Printf(TEXT("<b>%s</b> &middot; %s &middot; median of %d frames <span class=\"tag caught\">used</span>"), *BHHtmlEscape(TraceBound), *BHHtmlEscape(Conf), (int32)Num(Split, TEXT("frames")))
+			: FString(TEXT("Not available — no per-thread times in this capture"));
+		H += FString::Printf(TEXT("<tr><td class=\"dim\">Bound verdict<small>CPU vs GPU</small></td><td class=\"warm\">%s</td><td class=\"cold\">%s</td><td class=\"rec-cell\">The capture's verdict covers the whole representative run, so it wins over a single in-process frame</td></tr>"),
+			*LiveVerdictCell, *TraceVerdictCell);
 		H += TEXT("<tr><td class=\"dim\">Best use<small>role</small></td><td class=\"warm\">Quick sanity + verdict/hitch <b>logic</b> checks</td><td class=\"cold\"><b>Real stall identification</b> &amp; regression capture</td><td class=\"rec-cell\">Keep both — they answer different questions</td></tr>");
 		H += TEXT("</tbody></table></div>");
 	}
 
-	// Per-thread table
-	H += TEXT("<h2>Thread breakdown &middot; in-process frame</h2><div class=\"card table-scroll\"><table><thead><tr><th>Thread</th><th>ms</th><th>vs budget</th></tr></thead><tbody>");
+	// Per-thread table from the capture (issue #22): median / p95 over the run, and how often each thread
+	// was the slowest. Shown ahead of the single in-process frame because it's the representative one.
+	if (bTraceVerdict && Split.IsValid())
+	{
+		const TSharedPtr<FJsonObject> Share = ObjField(Trace, TEXT("bound_share"));
+		H += FString::Printf(TEXT("<h2>Thread breakdown &middot; captured run &middot; %d frames</h2><div class=\"card table-scroll\"><table><thead><tr><th>Thread</th><th>median ms</th><th>p95 ms</th><th>slowest in</th><th>median vs budget</th></tr></thead><tbody>"),
+			(int32)Num(Split, TEXT("frames")));
+		struct FCapRow { const TCHAR* Label; const TCHAR* Key; const TCHAR* BoundName; };
+		const FCapRow CapRows[] = {
+			{ TEXT("Game"),   TEXT("game_thread"),   TEXT("GameThread") },
+			{ TEXT("Render"), TEXT("render_thread"), TEXT("RenderThread") },
+			{ TEXT("RHI"),    TEXT("rhi_thread"),    TEXT("RHIThread") },
+			{ TEXT("GPU"),    TEXT("gpu"),           TEXT("GPU") },
+		};
+		for (const FCapRow& Cr : CapRows)
+		{
+			const TSharedPtr<FJsonObject> T = ObjField(Split, Cr.Key);
+			if (!T.IsValid()) continue; // thread not recorded (RHI-threading off / no GPU timing)
+			const double Med = Num(T, TEXT("median_ms"));
+			const bool bIsBound = TraceBound == Cr.BoundName;
+			H += FString::Printf(TEXT("<tr%s><td class=\"th-name\">%s%s</td><td class=\"num\">%.2f</td><td class=\"num\">%.2f</td><td class=\"num\">%.0f%%</td><td>%s</td></tr>"),
+				bIsBound ? TEXT(" class=\"bound\"") : TEXT(""), Cr.Label, bIsBound ? TEXT(" ◀") : TEXT(""),
+				Med, Num(T, TEXT("p95_ms")), Num(Share, Cr.BoundName) * 100.0,
+				Med > BudgetMs ? TEXT("<span class=\"pill crit\">over</span>") : TEXT("<span class=\"pill good\">ok</span>"));
+		}
+		H += TEXT("</tbody></table></div>");
+	}
+
+	// Per-thread table, in-process frame
+	H += FString::Printf(TEXT("<h2>Thread breakdown &middot; in-process frame%s</h2><div class=\"card table-scroll\"><table><thead><tr><th>Thread</th><th>ms</th><th>vs budget</th></tr></thead><tbody>"),
+		bInProcRepresentative ? TEXT("") : TEXT(" &middot; not representative"));
 	struct FRow { const TCHAR* Name; double Ms; bool bShow; };
 	const FRow Rows[] = {
 		{ TEXT("Game"),   GameMs,   true },
@@ -996,7 +1140,7 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 	{
 		if (!Rw.bShow) continue;
 		const bool bOver = Rw.Ms > BudgetMs;
-		const bool bIsBound = Bound.StartsWith(Rw.Name);
+		const bool bIsBound = bInProcRepresentative && LiveBound.StartsWith(Rw.Name);
 		H += FString::Printf(TEXT("<tr%s><td class=\"th-name\">%s%s</td><td class=\"num\">%.2f</td><td>%s</td></tr>"),
 			bIsBound ? TEXT(" class=\"bound\"") : TEXT(""),
 			Rw.Name, bIsBound ? TEXT(" ◀") : TEXT(""),
@@ -1070,7 +1214,8 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 	R->SetStringField(TEXT("report_file"), Path);
 	R->SetNumberField(TEXT("fix_count"), Fixes.Num());
 	R->SetBoolField(TEXT("included_capture"), bHasTrace);
-	R->SetStringField(TEXT("bound"), Bound);
+	R->SetStringField(TEXT("bound"), bVerdictUsable ? Bound : FString());
+	R->SetStringField(TEXT("bound_source"), BoundSource);
 	R->SetBoolField(TEXT("in_process_representative"), bInProcRepresentative);
 	if (!bInProcRepresentative) R->SetStringField(TEXT("in_process_caveat"), InProcCaveat);
 	R->SetStringField(TEXT("hint"), FString::Printf(
@@ -1211,7 +1356,9 @@ FString UBoundHoundService::StartStandalone(const FString& Name, const FString& 
 	const FString Busy = PlaySessionBusyReason();
 	if (!Busy.IsEmpty()) return PlaySessionBusyError(Busy);
 
-	const FString TraceName = Name.IsEmpty() ? TEXT("standalone_capture") : Name;
+	// The name goes into file names and a console command, so keep it to one token (no spaces or commas).
+	FString TraceName = Name.IsEmpty() ? TEXT("standalone_capture") : Name;
+	for (TCHAR& C : TraceName) { if (FChar::IsWhitespace(C) || C == TEXT(',') || C == TEXT('"')) C = TEXT('_'); }
 	const FString ChannelSet = Channels.IsEmpty() ? FString(DefaultTraceChannels()) : Channels;
 	const FString RunStamp = FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"));
 
@@ -1231,9 +1378,16 @@ FString UBoundHoundService::StartStandalone(const FString& Name, const FString& 
 	FString StandaloneLogPath = LogDir / FString::Printf(TEXT("%s_%s.log"), *TraceName, *RunStamp);
 	GLastLogFilePath = StandaloneLogPath;
 
+	// Issue #22: a CSV-profiler capture alongside the trace records GameThreadTime / RenderThreadTime /
+	// RHIThreadTime / GPUTime every frame -- the per-thread split a trace can't name (see
+	// BoundHoundVerdict::ParseCsvThreadSamples). It's named after the trace so Analyse can find it:
+	// Saved/Profiling/CSV/<name>_<stamp>.csv. Started by console command once the engine is up (the capture
+	// covers the run after load), and it runs until the process ends.
+	const FString CsvBase = FString::Printf(TEXT("%s_%s"), *TraceName, *RunStamp);
+	GLastCsvFilePath = CsvPathForTrace(TracePath);
 	FString ExtraArgs = FString::Printf(
-		TEXT("-trace=%s -tracefile=\"%s\" -abslog=\"%s\""),
-		*ChannelSet, *TracePath, *StandaloneLogPath);
+		TEXT("-trace=%s -tracefile=\"%s\" -abslog=\"%s\" -ExecCmds=\"CsvProfile StartFile=%s, CsvProfile Start\""),
+		*ChannelSet, *TracePath, *StandaloneLogPath, *CsvBase);
 
 	FRequestPlaySessionParams P;
 	P.SessionDestination = EPlaySessionDestinationType::NewProcess;
@@ -1253,6 +1407,7 @@ FString UBoundHoundService::StartStandalone(const FString& Name, const FString& 
 	R->SetStringField(TEXT("status"), TEXT("standalone start requested"));
 	R->SetStringField(TEXT("trace_file"), GLastTraceFilePath);
 	R->SetStringField(TEXT("log_file"),   GLastLogFilePath);
+	R->SetStringField(TEXT("csv_file"),   GLastCsvFilePath);
 	R->SetStringField(TEXT("channels"),   ChannelSet);
 	R->SetStringField(TEXT("hint"), TEXT("Call StopStandalone when done, then Analyse to read results."));
 	return OkJson(R);
@@ -1308,6 +1463,8 @@ FString UBoundHoundService::StopStandalone()
 		R->SetStringField(TEXT("trace_warning"), TEXT("No trace was written at trace_file. The standalone may have failed to launch, exited before tracing started, or been launched with a -tracehost override."));
 	}
 	R->SetStringField(TEXT("log_file"),   GLastLogFilePath);
+	R->SetStringField(TEXT("csv_file"),   GLastCsvFilePath);
+	R->SetBoolField(TEXT("csv_file_exists"), !GLastCsvFilePath.IsEmpty() && FM.FileExists(*GLastCsvFilePath));
 	R->SetStringField(TEXT("hint"),       TEXT("Allow a few seconds for the trace file to finalise, then call Analyse."));
 	return OkJson(R);
 }
@@ -1318,6 +1475,7 @@ FString UBoundHoundService::GetStandaloneStatus()
 	R->SetBoolField(TEXT("running"), GStandaloneRunning);
 	R->SetStringField(TEXT("last_trace_file"), GLastTraceFilePath);
 	R->SetStringField(TEXT("last_log_file"),   GLastLogFilePath);
+	R->SetStringField(TEXT("last_csv_file"),   GLastCsvFilePath);
 	return OkJson(R);
 }
 

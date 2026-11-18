@@ -492,4 +492,127 @@ bool FBoundHoundPlaySessionGuardTest::RunTest(const FString&)
 	return true;
 }
 
+// ---------------------------------------------------------------------------
+// Trace-derived verdict (issue #22)
+// ---------------------------------------------------------------------------
+
+namespace
+{
+	void AddSamples(TArray<BoundHoundVerdict::FThreadSample>& Out, int32 Count, double Game, double Render, double Rhi, double Gpu)
+	{
+		for (int32 i = 0; i < Count; ++i) { BoundHoundVerdict::FThreadSample S; S.GameMs = Game; S.RenderMs = Render; S.RhiMs = Rhi; S.GpuMs = Gpu; Out.Add(S); }
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundTraceVerdictTest,
+	"BoundHound.TraceVerdict.Classify", kBHTestFlags)
+bool FBoundHoundTraceVerdictTest::RunTest(const FString&)
+{
+	using namespace BoundHoundVerdict;
+
+	// Steady game-thread-bound run: clear, wins every frame.
+	{
+		TArray<FThreadSample> S; AddSamples(S, 100, 20.0, 8.0, 0.0, 10.0);
+		const FTraceVerdict T = ClassifyTrace(S);
+		TestEqual(TEXT("steady: GameThread"), T.Verdict.Bound, FString(TEXT("GameThread")));
+		TestEqual(TEXT("steady: clear"), T.Verdict.Confidence, FString(TEXT("clear")));
+		TestEqual(TEXT("steady: 100 samples"), T.SampleCount, 100);
+		TestEqual(TEXT("steady: game share 1.0"), T.ShareGame, 1.0);
+		TestFalse(TEXT("steady: RHI absent (all zero)"), T.bRhiAvailable);
+		TestEqual(TEXT("steady: game median"), T.Game.MedianMs, 20.0);
+	}
+
+	// GPU-bound run with one huge load frame on the game thread: the median ignores the spike.
+	{
+		TArray<FThreadSample> S; AddSamples(S, 99, 10.0, 5.0, 0.0, 14.0); AddSamples(S, 1, 30000.0, 5.0, 0.0, 14.0);
+		const FTraceVerdict T = ClassifyTrace(S);
+		TestEqual(TEXT("spike: GPU despite a 30 s game-thread frame"), T.Verdict.Bound, FString(TEXT("GPU")));
+		TestTrue (TEXT("spike: game avg is dragged up"), T.Game.AvgMs > 300.0);
+		TestEqual(TEXT("spike: game p95 unaffected"), T.Game.P95Ms, 10.0);
+	}
+
+	// Bottleneck alternates: GPU wins on medians but is the slowest thread in only 30% of frames.
+	{
+		TArray<FThreadSample> S;
+		AddSamples(S, 40, 20.0, 5.0, 0.0, 14.0);  // game-bound frames
+		AddSamples(S, 30, 10.0, 20.0, 0.0, 14.0); // render-bound frames
+		AddSamples(S, 30, 10.0, 5.0, 0.0, 15.0);  // gpu-bound frames
+		const FTraceVerdict T = ClassifyTrace(S);
+		TestEqual(TEXT("alternating: GPU on medians"), T.Verdict.Bound, FString(TEXT("GPU")));
+		TestEqual(TEXT("alternating: winner share 0.3"), T.WinnerShare, 0.3);
+		TestEqual(TEXT("alternating: downgraded to marginal"), T.Verdict.Confidence, FString(TEXT("marginal")));
+	}
+
+	// RHI recorded and dominant.
+	{
+		TArray<FThreadSample> S; AddSamples(S, 50, 8.0, 9.0, 18.0, 10.0);
+		const FTraceVerdict T = ClassifyTrace(S);
+		TestTrue (TEXT("rhi: available"), T.bRhiAvailable);
+		TestEqual(TEXT("rhi: RHIThread"), T.Verdict.Bound, FString(TEXT("RHIThread")));
+	}
+
+	// No samples: no verdict.
+	{
+		const FTraceVerdict T = ClassifyTrace({});
+		TestEqual(TEXT("empty: confidence none"), T.Verdict.Confidence, FString(TEXT("none")));
+		TestEqual(TEXT("empty: 0 samples"), T.SampleCount, 0);
+	}
+	return true;
+}
+
+// The CSV-profiler file is where the per-thread times come from (issue #22). Mirrors the real layout:
+// EVENTS first, the four thread columns somewhere in the middle, a repeated header + metadata row at the end,
+// and a last data row cut short because the process was killed.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundCsvParseTest,
+	"BoundHound.TraceVerdict.CsvParse", kBHTestFlags)
+bool FBoundHoundCsvParseTest::RunTest(const FString&)
+{
+	using namespace BoundHoundVerdict;
+	const FString Csv =
+		TEXT("EVENTS,FrameTime,RenderThreadTime,GameThreadTime,GPUTime,RHIThreadTime,Other\n")
+		TEXT(",20.0,6.0,18.5,9.0,2.0,1\n")
+		TEXT("GC,21.0,6.5,19.0,9.5,2.1,1\n")
+		TEXT(",19.0,5.5,17.5,8.5,1.9,1,7,8\n")                                                    // grew 2 columns mid-run
+		TEXT("EVENTS,FrameTime,RenderThreadTime,GameThreadTime,GPUTime,RHIThreadTime,Other,A,B\n") // repeated header
+		TEXT("[HasHeaderRowAtEnd],1,[platform],Windows\n")                                        // metadata
+		TEXT(",20.0,6.0,18.5,9.0,2.0,1,7,8,9,10,1");                                              // unterminated
+
+	TArray<FThreadSample> S; FCsvThreadColumns Cols;
+	TestTrue (TEXT("parses"), ParseCsvThreadSamples(Csv, S, Cols));
+	TestEqual(TEXT("3 data rows (wider row kept; header/metadata/unterminated skipped)"), S.Num(), 3);
+	TestTrue (TEXT("all four columns found"), Cols.bGame && Cols.bRender && Cols.bRhi && Cols.bGpu);
+	if (S.Num() == 3)
+	{
+		TestEqual(TEXT("row 2 game"),   S[1].GameMs, 19.0);
+		TestEqual(TEXT("row 2 render"), S[1].RenderMs, 6.5);
+		TestEqual(TEXT("row 2 gpu"),    S[1].GpuMs, 9.5);
+		TestEqual(TEXT("row 2 rhi"),    S[1].RhiMs, 2.1);
+		TestEqual(TEXT("verdict"), ClassifyTrace(S).Verdict.Bound, FString(TEXT("GameThread")));
+	}
+
+	// No RHIThreadTime column (RHI-threading off): RHI reads 0 and isn't ranked.
+	const FString NoRhi = TEXT("EVENTS,RenderThreadTime,GameThreadTime,GPUTime\n,5,10,14\n,5,10,14\n");
+	TestTrue (TEXT("no-rhi parses"), ParseCsvThreadSamples(NoRhi, S, Cols));
+	TestFalse(TEXT("no-rhi: column absent"), Cols.bRhi);
+	TestEqual(TEXT("no-rhi: GPU-bound"), ClassifyTrace(S).Verdict.Bound, FString(TEXT("GPU")));
+
+	// Missing a CPU thread column -> can't rank, no samples.
+	TestFalse(TEXT("missing GameThreadTime -> false"), ParseCsvThreadSamples(TEXT("EVENTS,RenderThreadTime,GPUTime\n,5,14\n"), S, Cols));
+	TestFalse(TEXT("empty -> false"), ParseCsvThreadSamples(FString(), S, Cols));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundPercentileTest,
+	"BoundHound.TraceVerdict.Percentile", kBHTestFlags)
+bool FBoundHoundPercentileTest::RunTest(const FString&)
+{
+	using BoundHoundVerdict::Percentile;
+	const TArray<double> V = { 5.0, 1.0, 4.0, 2.0, 3.0 };
+	TestEqual(TEXT("median of 1..5"), Percentile(V, 0.5), 3.0);
+	TestEqual(TEXT("p100 is max"), Percentile(V, 1.0), 5.0);
+	TestEqual(TEXT("p0 is min"), Percentile(V, 0.0), 1.0);
+	TestEqual(TEXT("empty -> 0"), Percentile({}, 0.5), 0.0);
+	return true;
+}
+
 #endif // WITH_AUTOMATION_TESTS

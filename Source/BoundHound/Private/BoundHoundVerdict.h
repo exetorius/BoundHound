@@ -140,6 +140,144 @@ namespace BoundHoundVerdict
 			: FString::Printf(TEXT("%.1f× slower than"), R);
 	}
 
+	// ---- Trace-derived verdict (issue #22) -------------------------------------------------------------
+	// A standalone run can't be read live, so its verdict comes from the per-frame thread times the CSV
+	// profiler writes into the trace. One sample = one frame's four thread times (ms; 0 = not recorded).
+	struct FThreadSample
+	{
+		double GameMs = 0.0, RenderMs = 0.0, RhiMs = 0.0, GpuMs = 0.0;
+	};
+
+	// Nearest-rank percentile (P in [0,1]) of an unsorted array; 0 for an empty array.
+	inline double Percentile(TArray<double> Values, double P)
+	{
+		if (Values.IsEmpty()) return 0.0;
+		Values.Sort();
+		const int32 Idx = FMath::Clamp((int32)FMath::CeilToDouble(P * Values.Num()) - 1, 0, Values.Num() - 1);
+		return Values[Idx];
+	}
+
+	struct FThreadStats { double AvgMs = 0.0, MedianMs = 0.0, P95Ms = 0.0; };
+
+	inline FThreadStats SummariseThread(const TArray<double>& Ms)
+	{
+		FThreadStats S;
+		if (Ms.IsEmpty()) return S;
+		double Sum = 0.0; for (double V : Ms) Sum += V;
+		S.AvgMs    = Sum / Ms.Num();
+		S.MedianMs = Percentile(Ms, 0.5);
+		S.P95Ms    = Percentile(Ms, 0.95);
+		return S;
+	}
+
+	struct FTraceVerdict
+	{
+		FVerdict Verdict;            // from the per-thread MEDIANS (robust to load spikes)
+		FThreadStats Game, Render, Rhi, Gpu;
+		bool bRhiAvailable = false, bGpuAvailable = false;
+		int32 SampleCount = 0;
+		// Share of frames where each thread was the slowest -- shows whether the bottleneck alternates.
+		double ShareGame = 0.0, ShareRender = 0.0, ShareRhi = 0.0, ShareGpu = 0.0;
+		double WinnerShare = 0.0;    // share of frames the median verdict's thread actually won
+	};
+
+	// Parse the per-frame thread times out of a CSV-profiler capture file. The engine writes GameThreadTime /
+	// RenderThreadTime / RHIThreadTime / GPUTime every frame (UpdateCoreCsvStats_EndFrame). They have to come
+	// from the CSV file: those stats are recorded with CSV_CUSTOM_STAT_MINIMAL_GLOBAL, which never sends the
+	// stat's name to Unreal Insights, so in a .utrace they're only unnamed "[unknownN]" counters.
+	// The CSV grows columns during a capture: stats first seen mid-run are appended as new columns, and the
+	// full header is only written at the end (lost when the process is killed). Existing columns never move,
+	// so the first-row header's indices stay valid. Rows shorter than that header are skipped (metadata rows),
+	// as are non-numeric cells (a repeated header) and an unterminated last line (cut short by the kill).
+	struct FCsvThreadColumns { bool bGame = false, bRender = false, bRhi = false, bGpu = false; };
+
+	inline bool ParseCsvThreadSamples(const FString& Content, TArray<FThreadSample>& Out, FCsvThreadColumns& Cols)
+	{
+		Out.Reset();
+		Cols = FCsvThreadColumns();
+		TArray<FString> Lines;
+		Content.ParseIntoArrayLines(Lines);
+		if (Lines.Num() < 2) return false;
+
+		TArray<FString> Header;
+		Lines[0].ParseIntoArray(Header, TEXT(","), false);
+		const int32 IGame   = Header.IndexOfByKey(TEXT("GameThreadTime"));
+		const int32 IRender = Header.IndexOfByKey(TEXT("RenderThreadTime"));
+		const int32 IRhi    = Header.IndexOfByKey(TEXT("RHIThreadTime"));
+		const int32 IGpu    = Header.IndexOfByKey(TEXT("GPUTime"));
+		Cols.bGame = IGame != INDEX_NONE; Cols.bRender = IRender != INDEX_NONE;
+		Cols.bRhi = IRhi != INDEX_NONE;   Cols.bGpu = IGpu != INDEX_NONE;
+		if (!Cols.bGame || !Cols.bRender) return false; // can't rank without both CPU threads
+
+		auto Read = [](const TArray<FString>& Row, int32 Idx, double& OutMs) -> bool
+		{
+			if (Idx == INDEX_NONE) { OutMs = 0.0; return true; }
+			const FString& Cell = Row[Idx];
+			if (Cell.IsEmpty() || !Cell.IsNumeric()) return false;
+			OutMs = FCString::Atod(*Cell);
+			return FMath::IsFinite(OutMs) && OutMs >= 0.0;
+		};
+
+		const bool bLastLineComplete = Content.EndsWith(TEXT("\n"));
+		const int32 LastLine = bLastLineComplete ? Lines.Num() : Lines.Num() - 1;
+		TArray<FString> Row;
+		for (int32 L = 1; L < LastLine; ++L)
+		{
+			Lines[L].ParseIntoArray(Row, TEXT(","), false);
+			if (Row.Num() < Header.Num()) continue; // metadata row
+			FThreadSample S;
+			if (Read(Row, IGame, S.GameMs) && Read(Row, IRender, S.RenderMs) && Read(Row, IRhi, S.RhiMs) && Read(Row, IGpu, S.GpuMs))
+			{
+				Out.Add(S);
+			}
+		}
+		return Out.Num() > 0;
+	}
+
+	// If the median winner is the slowest thread in fewer than this share of frames, the bottleneck
+	// alternates between threads, so the verdict is downgraded to "marginal".
+	static constexpr double MIN_WINNER_SHARE = 0.5;
+
+	inline FTraceVerdict ClassifyTrace(const TArray<FThreadSample>& Samples)
+	{
+		FTraceVerdict T;
+		T.SampleCount = Samples.Num();
+		if (Samples.IsEmpty())
+		{
+			T.Verdict.Confidence = TEXT("none");
+			return T;
+		}
+
+		TArray<double> G, R, Rhi, Gpu;
+		for (const FThreadSample& S : Samples) { G.Add(S.GameMs); R.Add(S.RenderMs); Rhi.Add(S.RhiMs); Gpu.Add(S.GpuMs); }
+		T.Game = SummariseThread(G); T.Render = SummariseThread(R); T.Rhi = SummariseThread(Rhi); T.Gpu = SummariseThread(Gpu);
+		T.bRhiAvailable = T.Rhi.MedianMs > 0.0;
+		T.bGpuAvailable = T.Gpu.MedianMs > 0.0;
+
+		T.Verdict = Classify(T.Game.MedianMs, T.Render.MedianMs, T.Rhi.MedianMs, T.Gpu.MedianMs, T.bRhiAvailable, T.bGpuAvailable);
+
+		int32 WG = 0, WR = 0, WRhi = 0, WGpu = 0;
+		for (const FThreadSample& S : Samples)
+		{
+			const FString Win = Classify(S.GameMs, S.RenderMs, S.RhiMs, S.GpuMs, T.bRhiAvailable, T.bGpuAvailable).Bound;
+			if      (Win == TEXT("GameThread"))   ++WG;
+			else if (Win == TEXT("RenderThread")) ++WR;
+			else if (Win == TEXT("RHIThread"))    ++WRhi;
+			else if (Win == TEXT("GPU"))          ++WGpu;
+		}
+		const double N = (double)Samples.Num();
+		T.ShareGame = WG / N; T.ShareRender = WR / N; T.ShareRhi = WRhi / N; T.ShareGpu = WGpu / N;
+		const FString& B = T.Verdict.Bound;
+		T.WinnerShare = B == TEXT("GameThread") ? T.ShareGame : B == TEXT("RenderThread") ? T.ShareRender
+		              : B == TEXT("RHIThread") ? T.ShareRhi : T.ShareGpu;
+
+		if (T.Verdict.Confidence != TEXT("none") && T.WinnerShare < MIN_WINNER_SHARE)
+		{
+			T.Verdict.Confidence = TEXT("marginal");
+		}
+		return T;
+	}
+
 	// Issue #28: starting a play session while another is running, queued or still ending queues a
 	// RequestPlaySession on top of the teardown and crashes the editor (TOptional IsSet assert). Returns
 	// why the editor is busy, or empty when it's safe to start a new session. Pure so it's testable.
