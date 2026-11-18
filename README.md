@@ -55,7 +55,10 @@ print(json.loads(unreal.BoundHoundService.frame_timing()))
       "gpu":           { "ms": 11.2, "headroom_ms": 5.47,  "over_budget": false }
     }
   },
-  "pie_running": true
+  "pie_running": true,
+  "frame_number": 18234,         // which engine frame this describes
+  "repeat_read": false,          // true = no new frame since the last call (confidence forced to "none")
+  "warming": false               // true for the first ~10 s of PIE (not representative yet)
 }
 ```
 

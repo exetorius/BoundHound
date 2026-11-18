@@ -235,7 +235,8 @@ bool FBoundHoundFrameTimingShapeTest::RunTest(const FString&)
 	// Required top-level fields of the verdict contract.
 	for (const TCHAR* Field : { TEXT("game_thread_ms"), TEXT("render_thread_ms"), TEXT("rhi_thread_ms"),
 		TEXT("gpu_ms"), TEXT("frame_ms"), TEXT("fps"), TEXT("bound"), TEXT("bound_confidence"),
-		TEXT("margin_ms"), TEXT("contested"), TEXT("hint"), TEXT("pie_running") })
+		TEXT("margin_ms"), TEXT("contested"), TEXT("hint"), TEXT("pie_running"),
+		TEXT("frame_number"), TEXT("timestamp"), TEXT("repeat_read"), TEXT("warming") })
 	{
 		TestTrue(FString::Printf(TEXT("has field %s"), Field), Obj->HasField(Field));
 	}
@@ -408,6 +409,86 @@ bool FBoundHoundReportSmokeTest::RunTest(const FString&)
 		TestTrue(TEXT("file has content"), FM.FileSize(*Path) > 0);
 		FM.Delete(*Path); // don't litter the project's Saved dir with test artifacts
 	}
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.1 field-report fixes (issues #23, #27, #28)
+// ---------------------------------------------------------------------------
+
+// #27: a read is a repeat only when a previous read exists and the frame counter hasn't moved.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundRepeatReadLogicTest,
+	"BoundHound.Freshness.RepeatReadLogic", kBHTestFlags)
+bool FBoundHoundRepeatReadLogicTest::RunTest(const FString&)
+{
+	TestFalse(TEXT("first read is never a repeat"), BoundHoundVerdict::IsRepeatRead(false, 100, 0));
+	TestFalse(TEXT("first read is never a repeat, even at frame 0"), BoundHoundVerdict::IsRepeatRead(false, 0, 0));
+	TestTrue (TEXT("same frame -> repeat"),        BoundHoundVerdict::IsRepeatRead(true, 100, 100));
+	TestFalse(TEXT("frame advanced -> fresh"),     BoundHoundVerdict::IsRepeatRead(true, 101, 100));
+	return true;
+}
+
+// #27 live: two FrameTiming calls inside one test (no frame can complete in between) -> the second is a
+// repeat read and must NOT carry a confident verdict.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundRepeatReadLiveTest,
+	"BoundHound.Freshness.RepeatReadLive", kBHTestFlags)
+bool FBoundHoundRepeatReadLiveTest::RunTest(const FString&)
+{
+	auto Parse = [](const FString& Json) { TSharedPtr<FJsonObject> O; FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json), O); return O; };
+	const TSharedPtr<FJsonObject> A = Parse(UBoundHoundService::FrameTiming(60.0f));
+	const TSharedPtr<FJsonObject> B = Parse(UBoundHoundService::FrameTiming(60.0f));
+	if (!TestTrue(TEXT("both reads parse"), A.IsValid() && B.IsValid())) return false;
+
+	TestEqual(TEXT("same frame_number"), A->GetNumberField(TEXT("frame_number")), B->GetNumberField(TEXT("frame_number")));
+	TestTrue (TEXT("second read flagged repeat_read"), B->GetBoolField(TEXT("repeat_read")));
+	TestEqual(TEXT("repeat read confidence is none"), B->GetStringField(TEXT("bound_confidence")), FString(TEXT("none")));
+	TestTrue (TEXT("hint explains the repeat"), B->GetStringField(TEXT("hint")).StartsWith(TEXT("REPEAT READ")));
+	return true;
+}
+
+// #23: PIE warm-up window.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundWarmingTest,
+	"BoundHound.Freshness.Warming", kBHTestFlags)
+bool FBoundHoundWarmingTest::RunTest(const FString&)
+{
+	TestTrue (TEXT("2 s into PIE is warming"),  BoundHoundVerdict::IsWarming(2.0));
+	TestTrue (TEXT("0 s into PIE is warming"),  BoundHoundVerdict::IsWarming(0.0));
+	TestFalse(TEXT("at the settle point -> settled"), BoundHoundVerdict::IsWarming(BoundHoundVerdict::SETTLE_SECONDS));
+	TestFalse(TEXT("60 s in -> settled"),       BoundHoundVerdict::IsWarming(60.0));
+	TestFalse(TEXT("no PIE (-1) -> not warming"), BoundHoundVerdict::IsWarming(-1.0));
+	return true;
+}
+
+// #23: the p95-vs-in-process ratio must read as a human ratio, never "~0x".
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundRatioTest,
+	"BoundHound.Report.RatioText", kBHTestFlags)
+bool FBoundHoundRatioTest::RunTest(const FString&)
+{
+	const FString Faster = BoundHoundVerdict::DescribeRatio(13.0, 70.6); // the field report's numbers
+	TestTrue(FString::Printf(TEXT("13 vs 70.6 reads 5.4x faster: '%s'"), *Faster),
+		Faster.Contains(TEXT("5.4")) && Faster.Contains(TEXT("faster")));
+	const FString Slower = BoundHoundVerdict::DescribeRatio(20.0, 10.0);
+	TestTrue(FString::Printf(TEXT("20 vs 10 reads 2.0x slower: '%s'"), *Slower),
+		Slower.Contains(TEXT("2.0")) && Slower.Contains(TEXT("slower")));
+	TestEqual(TEXT("within 10% -> about the same"), BoundHoundVerdict::DescribeRatio(10.5, 10.0), FString(TEXT("about the same as")));
+	TestTrue(TEXT("missing value -> empty"), BoundHoundVerdict::DescribeRatio(0.0, 10.0).IsEmpty());
+	TestTrue(TEXT("missing ref -> empty"),   BoundHoundVerdict::DescribeRatio(10.0, 0.0).IsEmpty());
+	return true;
+}
+
+// #28: any running / queued / ending play session blocks starting another; idle is safe.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundPlaySessionGuardTest,
+	"BoundHound.PlaySession.BusyGuard", kBHTestFlags)
+bool FBoundHoundPlaySessionGuardTest::RunTest(const FString&)
+{
+	using BoundHoundVerdict::PlaySessionBusyReason;
+	TestTrue (TEXT("idle editor -> safe"), PlaySessionBusyReason(false, false, false, false).IsEmpty());
+	TestFalse(TEXT("end-play queued (the #28 crash) -> busy"), PlaySessionBusyReason(true, false, true, true).IsEmpty());
+	TestTrue (TEXT("ending is reported as ending, not running"),
+		PlaySessionBusyReason(true, false, true, true).Contains(TEXT("ending")));
+	TestFalse(TEXT("request queued -> busy"), PlaySessionBusyReason(false, true, false, false).IsEmpty());
+	TestFalse(TEXT("PIE world live -> busy"), PlaySessionBusyReason(false, false, true, true).IsEmpty());
+	TestFalse(TEXT("session in progress -> busy"), PlaySessionBusyReason(false, false, false, true).IsEmpty());
 	return true;
 }
 
