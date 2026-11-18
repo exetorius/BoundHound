@@ -3,6 +3,8 @@
 #include "BoundHoundService.h"
 #include "BoundHoundVerdict.h"
 #include "BoundHoundDrilldown.h"
+#include "BoundHoundBaseline.h"
+#include "Misc/EngineVersion.h"
 #include "Json.h"
 #include "Misc/Paths.h"
 #include "Misc/FileHelper.h"
@@ -723,6 +725,7 @@ static FString AnalyseLogs(const FString& LogFile)
 	bool bRunStarted = false;
 	int32 BootLinesSkipped = 0;
 	FString RunCommandLine;
+	TMap<FString, FString> RunMetadata;
 
 	for (const FString& Line : Lines)
 	{
@@ -733,6 +736,10 @@ static FString AnalyseLogs(const FString& LogFile)
 
 		if (Line.Contains(TEXT("PSO creation hitch"))) ++PSOHitches;
 		if (RunCommandLine.IsEmpty() && Line.Contains(TEXT("LogInit: Command Line:"))) RunCommandLine = Line;
+		{
+			FString MetaKey, MetaValue; // issue #6: what the run ran on, from the CSV profiler's metadata lines
+			if (BoundHoundBaseline::ParseMetadataLine(Line, MetaKey, MetaValue)) RunMetadata.Add(MetaKey.ToLower(), MetaValue);
+		}
 
 		if (!bRunStarted && BoundHoundDrilldown::LogFrameTag(Line) > 0) bRunStarted = true;
 		if (!bError && (!bRunStarted || BoundHoundDrilldown::IsBootNoise(Line)))
@@ -770,6 +777,15 @@ static FString AnalyseLogs(const FString& LogFile)
 		if (RunResX > 0 && RunResY > 0) D->SetStringField(TEXT("resolution"), FString::Printf(TEXT("%dx%d"), RunResX, RunResY));
 		if (!RunMode.IsEmpty()) D->SetStringField(TEXT("window_mode"), RunMode);
 		Root->SetObjectField(TEXT("run_display"), D);
+	}
+
+	// Issue #6: what this run ran on (engine, platform, config, GPU, resolution, map...), for baselines.
+	const TMap<FString, FString> RunIdentity = BoundHoundBaseline::IdentityFromMetadata(RunMetadata);
+	if (RunIdentity.Num() > 0)
+	{
+		TSharedPtr<FJsonObject> Id = MakeShared<FJsonObject>();
+		for (const TPair<FString, FString>& KV : RunIdentity) Id->SetStringField(KV.Key, KV.Value);
+		Root->SetObjectField(TEXT("run_identity"), Id);
 	}
 
 	return OkJson(Root);
@@ -1286,7 +1302,8 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 	const TSharedPtr<FJsonObject>* TracePtr = nullptr;
 	const TSharedPtr<FJsonObject>* LogsPtr  = nullptr;
 	if (AN.IsValid()) { AN->TryGetObjectField(TEXT("trace"), TracePtr); AN->TryGetObjectField(TEXT("logs"), LogsPtr); }
-	const TSharedPtr<FJsonObject> Trace = TracePtr ? *TracePtr : nullptr;
+	// Source "trace" returns the trace result itself, not nested under "trace".
+	const TSharedPtr<FJsonObject> Trace = TracePtr ? *TracePtr : ((AN.IsValid() && AN->HasField(TEXT("trace_file"))) ? AN : nullptr);
 	const TSharedPtr<FJsonObject> Logs  = LogsPtr  ? *LogsPtr  : nullptr;
 
 	const double GameMs   = Num(FT, TEXT("game_thread_ms"));
@@ -2050,5 +2067,276 @@ FString UBoundHoundService::StopPIE()
 	TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
 	R->SetStringField(TEXT("status"), TEXT("PIE end requested"));
 	R->SetStringField(TEXT("hint"),   TEXT("PIE tears down on the next tick. If you were tracing, StopTrace then Analyse."));
+	return OkJson(R);
+}
+
+// ---------------------------------------------------------------------------
+// Baseline + diff (issue #6)
+// ---------------------------------------------------------------------------
+
+static FString BaselineDir()
+{
+	return ProjectSavedDirAbs() / TEXT("BoundHound") / TEXT("baselines");
+}
+
+static TSharedPtr<FJsonObject> BLParse(const FString& Json)
+{
+	TSharedPtr<FJsonObject> O;
+	return FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json), O) ? O : nullptr;
+}
+static TSharedPtr<FJsonObject> BLObj(const TSharedPtr<FJsonObject>& O, const TCHAR* K)
+{
+	const TSharedPtr<FJsonObject>* P = nullptr;
+	return (O.IsValid() && O->TryGetObjectField(K, P) && P) ? *P : nullptr;
+}
+
+// Build a snapshot of the current run. "capture" = a standalone run's analysis (trace + CSV + log);
+// "live" = the current FrameTiming frame. Returns false with an error JSON in OutError.
+static bool BuildSnapshot(const FString& Source, const FString& File, BoundHoundBaseline::FSnapshot& S, TArray<FString>& Notes, FString& OutError)
+{
+	const FString Kind = Source.IsEmpty() ? FString(TEXT("capture")) : Source.ToLower();
+	S.Kind = Kind;
+	S.Created = FDateTime::UtcNow().ToIso8601();
+
+	if (Kind == TEXT("live"))
+	{
+		const TSharedPtr<FJsonObject> FT = BLParse(UBoundHoundService::FrameTiming(60.0f));
+		if (!FT.IsValid() || !FT->GetBoolField(TEXT("success")))
+		{
+			OutError = ErrJson(TEXT("NO_READING"), TEXT("FrameTiming returned no reading."));
+			return false;
+		}
+		auto Put = [&](const TCHAR* From, const TCHAR* To) { double V = 0.0; if (FT->TryGetNumberField(From, V) && V > 0.0) S.Metrics.Add(To, V); };
+		Put(TEXT("frame_ms"), TEXT("frame_ms"));
+		Put(TEXT("game_thread_ms"), TEXT("game_ms"));
+		Put(TEXT("render_thread_ms"), TEXT("render_ms"));
+		Put(TEXT("rhi_thread_ms"), TEXT("rhi_ms"));
+		Put(TEXT("gpu_ms"), TEXT("gpu_ms"));
+		FT->TryGetStringField(TEXT("bound"), S.Bound);
+		bool bFlag = false;
+		if (FT->TryGetBoolField(TEXT("repeat_read"), bFlag) && bFlag) Notes.Add(TEXT("This frame was a repeat read (no new frame since the last sample)."));
+		if (FT->TryGetBoolField(TEXT("warming"), bFlag) && bFlag) Notes.Add(TEXT("PIE was still warming up: this frame isn't representative."));
+		if (FT->TryGetBoolField(TEXT("pie_running"), bFlag) && !bFlag) Notes.Add(TEXT("PIE isn't running: this frame measures the editor viewport, not the game."));
+
+		S.Identity.Add(TEXT("engineversion"), FEngineVersion::Current().ToString());
+		S.Identity.Add(TEXT("platform"), FPlatformProperties::IniPlatformName());
+		S.Identity.Add(TEXT("config"), LexToString(FApp::GetBuildConfiguration()));
+		S.Identity.Add(TEXT("project"), FApp::GetProjectName());
+		FString Rhi = FApp::GetGraphicsRHI(); // "D3D12 (SM6)"; run logs say "D3D12"
+		Rhi.Split(TEXT(" ("), &Rhi, nullptr);
+		S.Identity.Add(TEXT("rhiname"), Rhi.TrimStartAndEnd());
+		UWorld* World = (GEditor && GEditor->PlayWorld) ? GEditor->PlayWorld.Get() : (GEditor ? GEditor->GetEditorWorldContext().World() : nullptr);
+		if (World) S.Identity.Add(TEXT("map"), UWorld::RemovePIEPrefix(World->GetOutermost()->GetName()));
+		S.Source = TEXT("FrameTiming");
+		return true;
+	}
+	if (Kind != TEXT("capture"))
+	{
+		OutError = ErrJson(TEXT("BAD_SOURCE"), TEXT("Source must be 'capture' or 'live'."));
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject> AN = BLParse(UBoundHoundService::Analyse(TEXT("both"), File));
+	const TSharedPtr<FJsonObject> Trace = BLObj(AN, TEXT("trace"));
+	const TSharedPtr<FJsonObject> Logs = BLObj(AN, TEXT("logs"));
+	if (!Trace.IsValid())
+	{
+		OutError = ErrJson(TEXT("NO_CAPTURE"), TEXT("No capture to read. Run start_standalone / stop_standalone first, or pass File=<trace or log path>."));
+		return false;
+	}
+	if (!Trace->GetBoolField(TEXT("success")))
+	{
+		FString Msg; Trace->TryGetStringField(TEXT("error"), Msg);
+		OutError = ErrJson(TEXT("ANALYSIS_FAILED"), FString::Printf(TEXT("The capture couldn't be analysed: %s"), *Msg));
+		return false;
+	}
+	Trace->TryGetStringField(TEXT("trace_file"), S.Source);
+	auto Put = [&](const TSharedPtr<FJsonObject>& O, const TCHAR* From, const FString& To)
+	{
+		double V = 0.0;
+		if (O.IsValid() && O->TryGetNumberField(From, V)) S.Metrics.Add(To, V);
+	};
+	Put(Trace, TEXT("avg_frame_ms"), TEXT("frame_avg_ms"));
+	Put(Trace, TEXT("p95_frame_ms"), TEXT("frame_p95_ms"));
+	Put(Trace, TEXT("max_frame_ms"), TEXT("worst_frame_ms"));
+	const TSharedPtr<FJsonObject> Split = BLObj(Trace, TEXT("thread_split"));
+	struct FThreadKey { const TCHAR* Obj; const TCHAR* Prefix; };
+	const FThreadKey Threads[] = {
+		{ TEXT("game_thread"), TEXT("game") }, { TEXT("render_thread"), TEXT("render") },
+		{ TEXT("rhi_thread"), TEXT("rhi") }, { TEXT("gpu"), TEXT("gpu") } };
+	for (const FThreadKey& T : Threads)
+	{
+		const TSharedPtr<FJsonObject> O = BLObj(Split, T.Obj);
+		Put(O, TEXT("median_ms"), FString::Printf(TEXT("%s_median_ms"), T.Prefix));
+		Put(O, TEXT("p95_ms"), FString::Printf(TEXT("%s_p95_ms"), T.Prefix));
+	}
+	if (!Split.IsValid() || !Split->GetBoolField(TEXT("available")))
+	{
+		Notes.Add(TEXT("No per-thread times in this capture (no CSV next to the trace): only whole-frame stats are compared."));
+	}
+	Put(BLObj(Trace, TEXT("spikes")), TEXT("spike_events"), TEXT("spike_events"));
+	Put(Logs, TEXT("pso_hitches"), TEXT("pso_hitches"));
+	Put(Logs, TEXT("errors"), TEXT("log_errors"));
+	Trace->TryGetStringField(TEXT("bound"), S.Bound);
+
+	if (const TSharedPtr<FJsonObject> Id = BLObj(Logs, TEXT("run_identity")))
+	{
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& KV : Id->Values) S.Identity.Add(KV.Key, KV.Value->AsString());
+	}
+	else
+	{
+		Notes.Add(TEXT("The run's log has no CSV-profiler metadata, so engine / GPU / resolution can't be checked from the run itself."));
+	}
+	if (const TSharedPtr<FJsonObject> Cap = BLObj(Trace, TEXT("frame_cap")))
+	{
+		S.Identity.Add(TEXT("frame_cap"), Cap->GetBoolField(TEXT("capped")) ? FString::Printf(TEXT("%d"), (int32)Cap->GetNumberField(TEXT("cap_fps"))) : FString(TEXT("uncapped")));
+	}
+	return true;
+}
+
+FString UBoundHoundService::SaveBaseline(const FString& Name, const FString& Scenario, const FString& Source, const FString& File)
+{
+	BoundHoundBaseline::FSnapshot S;
+	TArray<FString> Notes;
+	FString Err;
+	if (!BuildSnapshot(Source, File, S, Notes, Err)) return Err;
+	S.Name = BoundHoundBaseline::SanitiseName(Name);
+	S.Scenario = Scenario.TrimStartAndEnd();
+
+	FString Json;
+	FJsonSerializer::Serialize(BoundHoundBaseline::ToJson(S), TJsonWriterFactory<>::Create(&Json));
+	const FString Path = BaselineDir() / (S.Name + TEXT(".json"));
+	IPlatformFile::GetPlatformPhysical().CreateDirectoryTree(*BaselineDir());
+	const bool bExisted = FPaths::FileExists(Path);
+	if (!FFileHelper::SaveStringToFile(Json, *Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+	{
+		return ErrJson(TEXT("WRITE_FAILED"), FString::Printf(TEXT("Couldn't write %s"), *Path));
+	}
+
+	TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("baseline_file"), Path);
+	R->SetBoolField(TEXT("overwrote"), bExisted);
+	R->SetObjectField(TEXT("baseline"), BoundHoundBaseline::ToJson(S));
+	if (S.Scenario.IsEmpty()) Notes.Add(TEXT("No scenario label given. Name the workload (map, route, duration) so a later comparison can say whether the runs claim to do the same thing."));
+	TArray<TSharedPtr<FJsonValue>> NoteArr;
+	for (const FString& N : Notes) NoteArr.Add(MakeShared<FJsonValueString>(N));
+	R->SetArrayField(TEXT("notes"), NoteArr);
+	R->SetStringField(TEXT("hint"), FString::Printf(TEXT("After your change, capture the same scenario again, then compare_baseline(\"%s\")."), *S.Name));
+	return OkJson(R);
+}
+
+FString UBoundHoundService::CompareBaseline(const FString& Name, const FString& Source, const FString& File, bool bForce)
+{
+	const FString SafeName = BoundHoundBaseline::SanitiseName(Name);
+	const FString Path = BaselineDir() / (SafeName + TEXT(".json"));
+	FString Json;
+	if (!FFileHelper::LoadFileToString(Json, *Path))
+	{
+		return ErrJson(TEXT("NO_BASELINE"), FString::Printf(TEXT("No baseline '%s' (%s). list_baselines() shows the saved ones."), *SafeName, *Path));
+	}
+	BoundHoundBaseline::FSnapshot Base;
+	if (!BoundHoundBaseline::FromJson(BLParse(Json), Base))
+	{
+		return ErrJson(TEXT("BAD_BASELINE"), FString::Printf(TEXT("%s isn't a BoundHound baseline."), *Path));
+	}
+
+	BoundHoundBaseline::FSnapshot Cur;
+	TArray<FString> Notes;
+	FString Err;
+	if (!BuildSnapshot(Source.IsEmpty() ? Base.Kind : Source, File, Cur, Notes, Err)) return Err;
+	if (Base.Kind == TEXT("capture") && !Base.Source.IsEmpty() && Base.Source == Cur.Source)
+	{
+		Notes.Add(TEXT("The current run is the same capture the baseline was saved from: every delta is zero by construction."));
+	}
+
+	const BoundHoundBaseline::FComparison C = BoundHoundBaseline::Compare(Base, Cur, bForce);
+
+	TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("baseline"), SafeName);
+	R->SetStringField(TEXT("baseline_created"), Base.Created);
+	R->SetStringField(TEXT("baseline_source"), Base.Source);
+	R->SetStringField(TEXT("current_source"), Cur.Source);
+	R->SetStringField(TEXT("scenario"), Base.Scenario);
+	R->SetStringField(TEXT("scenario_note"), Base.Scenario.IsEmpty()
+		? FString(TEXT("The baseline has no scenario label. BoundHound can't tell whether the two runs did the same work."))
+		: FString::Printf(TEXT("Scenario '%s' is the label given when the baseline was saved. BoundHound doesn't verify the current run did the same work."), *Base.Scenario));
+
+	TArray<TSharedPtr<FJsonValue>> MisArr;
+	for (const BoundHoundBaseline::FMismatch& M : C.Mismatches)
+	{
+		TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetStringField(TEXT("field"), M.Field);
+		O->SetStringField(TEXT("baseline"), M.Baseline);
+		O->SetStringField(TEXT("current"), M.Current);
+		O->SetStringField(TEXT("severity"), M.bHard ? TEXT("hard") : TEXT("soft"));
+		MisArr.Add(MakeShared<FJsonValueObject>(O));
+	}
+	R->SetArrayField(TEXT("mismatches"), MisArr);
+
+	if (C.bHardMismatch && !bForce)
+	{
+		R->SetBoolField(TEXT("success"), false);
+		R->SetStringField(TEXT("error_code"), TEXT("BASELINE_MISMATCH"));
+		R->SetStringField(TEXT("error"), TEXT("The runs differ in engine version, platform, build config, project or kind, so their numbers measure different things. Save a new baseline for this setup, or pass force=True to compare anyway."));
+		FString Out;
+		FJsonSerializer::Serialize(R.ToSharedRef(), TJsonWriterFactory<>::Create(&Out));
+		return Out;
+	}
+
+	R->SetBoolField(TEXT("comparable"), C.Mismatches.IsEmpty());
+	TArray<TSharedPtr<FJsonValue>> DeltaArr, Summary;
+	for (const BoundHoundBaseline::FDelta& D : C.Deltas)
+	{
+		TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetStringField(TEXT("metric"), D.Key);
+		O->SetNumberField(TEXT("baseline"), FMath::RoundToDouble(D.Baseline * 100.0) / 100.0);
+		O->SetNumberField(TEXT("current"), FMath::RoundToDouble(D.Current * 100.0) / 100.0);
+		O->SetNumberField(TEXT("delta"), FMath::RoundToDouble(D.Delta * 100.0) / 100.0);
+		if (D.Baseline != 0.0) O->SetNumberField(TEXT("delta_pct"), FMath::RoundToDouble(D.DeltaPct * 10.0) / 10.0);
+		O->SetBoolField(TEXT("changed"), D.bChanged);
+		DeltaArr.Add(MakeShared<FJsonValueObject>(O));
+		if (D.bChanged) Summary.Add(MakeShared<FJsonValueString>(D.Statement));
+	}
+	if (C.bBoundChanged)
+	{
+		Summary.Insert(MakeShared<FJsonValueString>(FString::Printf(TEXT("bound verdict %s -> %s"), *Base.Bound, *Cur.Bound)), 0);
+	}
+	if (Summary.IsEmpty()) Summary.Add(MakeShared<FJsonValueString>(TEXT("No metric changed beyond run-to-run noise.")));
+	R->SetArrayField(TEXT("deltas"), DeltaArr);
+	R->SetArrayField(TEXT("summary"), Summary);
+	R->SetStringField(TEXT("bound_baseline"), Base.Bound);
+	R->SetStringField(TEXT("bound_current"), Cur.Bound);
+	R->SetBoolField(TEXT("bound_changed"), C.bBoundChanged);
+	TArray<TSharedPtr<FJsonValue>> WarnArr;
+	for (const FString& W : C.Warnings) WarnArr.Add(MakeShared<FJsonValueString>(W));
+	for (const FString& N : Notes) WarnArr.Add(MakeShared<FJsonValueString>(N));
+	R->SetArrayField(TEXT("warnings"), WarnArr);
+	R->SetStringField(TEXT("note"), TEXT("Factual deltas only: BoundHound doesn't say what caused a change. 'changed' = beyond noise (0.1 ms and 3% for a capture, 10% for a live frame; any change for counts)."));
+	return OkJson(R);
+}
+
+FString UBoundHoundService::ListBaselines()
+{
+	TArray<FString> Files;
+	IFileManager::Get().FindFiles(Files, *(BaselineDir() / TEXT("*.json")), true, false);
+	Files.Sort();
+	TArray<TSharedPtr<FJsonValue>> Arr;
+	for (const FString& F : Files)
+	{
+		FString Json;
+		BoundHoundBaseline::FSnapshot S;
+		if (!FFileHelper::LoadFileToString(Json, *(BaselineDir() / F)) || !BoundHoundBaseline::FromJson(BLParse(Json), S)) continue;
+		TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetStringField(TEXT("name"), FPaths::GetBaseFilename(F));
+		O->SetStringField(TEXT("kind"), S.Kind);
+		O->SetStringField(TEXT("scenario"), S.Scenario);
+		O->SetStringField(TEXT("created"), S.Created);
+		O->SetStringField(TEXT("bound"), S.Bound);
+		if (const FString* Map = S.Identity.Find(TEXT("map"))) O->SetStringField(TEXT("map"), *Map);
+		Arr.Add(MakeShared<FJsonValueObject>(O));
+	}
+	TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("dir"), BaselineDir());
+	R->SetArrayField(TEXT("baselines"), Arr);
 	return OkJson(R);
 }

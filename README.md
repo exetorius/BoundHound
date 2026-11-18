@@ -101,6 +101,7 @@ The incumbents win on *depth* — once you know **where** to look, Insights and 
 | `start_standalone(name, channels, res_x, res_y, fullscreen)` | Launch the game as a separate standalone process with a trace attached (+ its own timestamped log and a CSV capture of per-frame thread times), optionally at a fixed resolution / fullscreen so runs are comparable. |
 | `stop_standalone()` / `get_standalone_status()` | Control / inspect the standalone capture. |
 | `start_pie()` / `stop_pie()` | Start/stop **in-process** Play-In-Editor so `frame_timing`/`force_hitch` read a live game world. Quick checks only — see note below. |
+| `save_baseline(name, scenario, source="capture", file="")` / `compare_baseline(name, source, file, force=False)` / `list_baselines()` | **Before / after.** Save a run (a standalone capture, or one live frame) as a named baseline with what it ran on, then compare a later run against it: factual per-metric deltas (`GPU median 9.75 -> 11.02 ms (+1.27 ms, +13.0%)`), what changed beyond noise, verdict changes. Refuses to compare across engine / platform / config / project; warns on GPU / resolution / map / frame-cap / scenario differences. |
 | `report(title, source="both", file="")` | Render a **self-contained HTML "printout"** — the live verdict + budget and (when a capture is available) the frame stats, worst frames and PSO hitches, plus a data-driven "fix in this order" list — to `Saved/BoundHound/report_<ts>.html`. Portable: open in any browser, screenshot, or share. |
 
 All methods return a JSON string. Full workflow and gotchas in [`docs/USAGE.md`](docs/USAGE.md).
@@ -231,7 +232,6 @@ MIT — see [LICENSE](LICENSE). Do whatever you like with it.
 
 ## Roadmap ideas
 
-- **Baseline + diff** ("game thread +3.2 ms since last capture").
 - **Auto drill-down**: when `bound == GameThread`, fire `stat dumpframe` and parse the worst scopes automatically.
 
 PRs and issues welcome.

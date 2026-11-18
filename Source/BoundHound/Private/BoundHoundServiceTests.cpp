@@ -6,6 +6,7 @@
 
 #include "BoundHoundVerdict.h"
 #include "BoundHoundDrilldown.h"
+#include "BoundHoundBaseline.h"
 #include "BoundHoundService.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -874,6 +875,146 @@ bool FBoundHoundCsvAlignTest::RunTest(const FString&)
 	TestEqual(TEXT("no match -> INDEX_NONE"), AlignCsvToTrace(Other, Csv), (int32)INDEX_NONE);
 
 	TestEqual(TEXT("too short -> INDEX_NONE"), AlignCsvToTrace(Trace, { 1.0, 2.0 }), (int32)INDEX_NONE);
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Baseline + diff (issue #6)
+// ---------------------------------------------------------------------------
+
+static BoundHoundBaseline::FSnapshot MakeCaptureSnapshot()
+{
+	BoundHoundBaseline::FSnapshot S;
+	S.Kind = TEXT("capture"); S.Scenario = TEXT("Rendlesham, 3 min walk"); S.Bound = TEXT("GPU");
+	S.Identity = { { TEXT("engineversion"), TEXT("5.8.4-58902052+++UE5+Release-5.8") }, { TEXT("platform"), TEXT("Windows") },
+	               { TEXT("config"), TEXT("Development") }, { TEXT("project"), TEXT("Corvus") }, { TEXT("gpu"), TEXT("RTX 4070 Ti") },
+	               { TEXT("resolution"), TEXT("3434x1352") }, { TEXT("map"), TEXT("/Game/Maps/Rendlesham") }, { TEXT("frame_cap"), TEXT("uncapped") } };
+	S.Metrics = { { TEXT("frame_avg_ms"), 11.2 }, { TEXT("gpu_median_ms"), 9.75 }, { TEXT("game_median_ms"), 4.55 }, { TEXT("pso_hitches"), 6.0 } };
+	return S;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundBaselineCompareTest,
+	"BoundHound.Baseline.Compare", kBHTestFlags)
+bool FBoundHoundBaselineCompareTest::RunTest(const FString&)
+{
+	using namespace BoundHoundBaseline;
+	const FSnapshot Base = MakeCaptureSnapshot();
+
+	// Same run: nothing changed, no mismatches.
+	const FComparison Same = Compare(Base, Base, false);
+	TestTrue (TEXT("same: no mismatches"), Same.Mismatches.IsEmpty());
+	TestEqual(TEXT("same: 4 deltas"), Same.Deltas.Num(), 4);
+	TestFalse(TEXT("same: nothing changed"), Same.Deltas.ContainsByPredicate([](const FDelta& D) { return D.bChanged; }));
+
+	// GPU got 1.27 ms slower, game thread moved within noise, two more PSO hitches.
+	FSnapshot Cur = Base;
+	Cur.Metrics[TEXT("gpu_median_ms")] = 11.02;
+	Cur.Metrics[TEXT("game_median_ms")] = 4.6;
+	Cur.Metrics[TEXT("pso_hitches")] = 8.0;
+	const FComparison C = Compare(Base, Cur, false);
+	auto Find = [&](const TCHAR* K) { return C.Deltas.FindByPredicate([K](const FDelta& D) { return D.Key == K; }); };
+	const FDelta* Gpu = Find(TEXT("gpu_median_ms"));
+	TestTrue (TEXT("gpu delta present"), Gpu != nullptr);
+	if (Gpu)
+	{
+		TestTrue (TEXT("gpu +1.27 ms"), FMath::IsNearlyEqual(Gpu->Delta, 1.27, 0.001));
+		TestTrue (TEXT("gpu +13.0%"), FMath::IsNearlyEqual(Gpu->DeltaPct, 13.03, 0.01));
+		TestTrue (TEXT("gpu changed"), Gpu->bChanged);
+		TestEqual(TEXT("gpu statement"), Gpu->Statement, FString(TEXT("GPU median 9.75 -> 11.02 ms (+1.27 ms, +13.0%)")));
+	}
+	const FDelta* Game = Find(TEXT("game_median_ms"));
+	TestTrue(TEXT("game +0.05 ms is noise"), Game && !Game->bChanged);
+	const FDelta* Pso = Find(TEXT("pso_hitches"));
+	TestTrue(TEXT("pso count change counts"), Pso && Pso->bChanged && Pso->Statement == TEXT("PSO hitches 6 -> 8 (+2)"));
+
+	// Verdict change.
+	Cur.Bound = TEXT("GameThread");
+	TestTrue(TEXT("bound change flagged"), Compare(Base, Cur, false).bBoundChanged);
+
+	// Hard mismatch (another engine build): refused, no deltas, unless forced.
+	FSnapshot Other = Base;
+	Other.Identity[TEXT("engineversion")] = TEXT("5.8.5-59000000+++UE5+Release-5.8");
+	const FComparison Hard = Compare(Base, Other, false);
+	TestTrue (TEXT("engine mismatch is hard"), Hard.bHardMismatch);
+	TestEqual(TEXT("refused: no deltas"), Hard.Deltas.Num(), 0);
+	const FComparison Forced = Compare(Base, Other, true);
+	TestTrue (TEXT("forced: deltas"), Forced.Deltas.Num() > 0);
+	TestTrue (TEXT("forced: warned"), Forced.Warnings.ContainsByPredicate([](const FString& W) { return W.StartsWith(TEXT("Forced past")); }));
+
+	// Kind mismatch (a live frame vs a capture) is hard too.
+	FSnapshot Live = Base; Live.Kind = TEXT("live");
+	TestTrue(TEXT("kind mismatch is hard"), Compare(Base, Live, false).bHardMismatch);
+
+	// Soft mismatches compare, with warnings: resolution, frame cap, scenario.
+	FSnapshot Soft = Base;
+	Soft.Identity[TEXT("resolution")] = TEXT("1920x1080");
+	Soft.Identity[TEXT("frame_cap")] = TEXT("60");
+	Soft.Scenario = TEXT("Rendlesham, combat");
+	const FComparison S = Compare(Base, Soft, false);
+	TestFalse(TEXT("soft: not hard"), S.bHardMismatch);
+	TestEqual(TEXT("soft: 3 mismatches"), S.Mismatches.Num(), 3);
+	TestTrue (TEXT("soft: still compared"), S.Deltas.Num() == 4);
+	TestTrue (TEXT("soft: cap warning"), S.Warnings.ContainsByPredicate([](const FString& W) { return W.Contains(TEXT("frame cap")); }));
+	TestTrue (TEXT("soft: scenario warning"), S.Warnings.ContainsByPredicate([](const FString& W) { return W.Contains(TEXT("scenario")); }));
+
+	// A field missing on one side can't be checked, so it's not a mismatch.
+	FSnapshot NoGpu = Base; NoGpu.Identity.Remove(TEXT("gpu"));
+	TestTrue(TEXT("unknown field: no mismatch"), Compare(Base, NoGpu, false).Mismatches.IsEmpty());
+
+	// Live frames are noisy: a 5% move isn't a change there, but is in a capture.
+	FSnapshot LiveA; LiveA.Kind = TEXT("live"); LiveA.Metrics = { { TEXT("gpu_ms"), 10.0 } };
+	FSnapshot LiveB = LiveA; LiveB.Metrics[TEXT("gpu_ms")] = 10.5;
+	TestFalse(TEXT("live: 5% is noise"), Compare(LiveA, LiveB, false).Deltas[0].bChanged);
+	FSnapshot CapA; CapA.Kind = TEXT("capture"); CapA.Metrics = { { TEXT("gpu_median_ms"), 10.0 } };
+	FSnapshot CapB = CapA; CapB.Metrics[TEXT("gpu_median_ms")] = 10.5;
+	TestTrue (TEXT("capture: 5% is a change"), Compare(CapA, CapB, false).Deltas[0].bChanged);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundBaselineIdentityTest,
+	"BoundHound.Baseline.IdentityAndJson", kBHTestFlags)
+bool FBoundHoundBaselineIdentityTest::RunTest(const FString&)
+{
+	using namespace BoundHoundBaseline;
+	// Lines from the field report's log.
+	const TCHAR* Lines[] = {
+		TEXT("LogCsvProfiler: Display: Metadata set : platform=\"Windows\""),
+		TEXT("LogCsvProfiler: Display: Metadata set : config=\"Development\""),
+		TEXT("LogCsvProfiler: Display: Metadata set : engineversion=\"5.8.4-58902052+++UE5+Release-5.8\""),
+		TEXT("LogCsvProfiler: Display: Metadata set : commandline=\"\" \"../../../../../Repos Unreal/Invasion/Corvus.uproject\" /Game/Maps/FirstEncounter/Rendlesham -game -PIEVIACONSOLE\""),
+		TEXT("LogCsvProfiler: Display: Metadata set : systemresolution.resx=\"1280\""),
+		TEXT("[2026.11.18-13.18.19:093][  0]LogCsvProfiler: Display: Metadata set : systemresolution.resx=\"3434\""),
+		TEXT("[2026.11.18-13.18.19:093][  0]LogCsvProfiler: Display: Metadata set : systemresolution.resy=\"1352\""),
+		TEXT("[2026.11.18-13.18.20:600][  0]LogCsvProfiler: Display: Metadata set : gpu=\"NVIDIA GeForce RTX 4070 Ti\""),
+		TEXT("LogTemp: unrelated"),
+	};
+	TMap<FString, FString> Meta;
+	for (const TCHAR* L : Lines)
+	{
+		FString K, V;
+		if (ParseMetadataLine(L, K, V)) Meta.Add(K.ToLower(), V);
+	}
+	TestEqual(TEXT("8 metadata lines, 7 keys (resx set twice)"), Meta.Num(), 7);
+	const TMap<FString, FString> Id = IdentityFromMetadata(Meta);
+	TestEqual(TEXT("gpu"), Id.FindRef(TEXT("gpu")), FString(TEXT("NVIDIA GeForce RTX 4070 Ti")));
+	TestEqual(TEXT("last resolution wins"), Id.FindRef(TEXT("resolution")), FString(TEXT("3434x1352")));
+	TestEqual(TEXT("map from command line"), Id.FindRef(TEXT("map")), FString(TEXT("/Game/Maps/FirstEncounter/Rendlesham")));
+	TestEqual(TEXT("project from a path with spaces"), Id.FindRef(TEXT("project")), FString(TEXT("Corvus")));
+	TestEqual(TEXT("engine"), Id.FindRef(TEXT("engineversion")), FString(TEXT("5.8.4-58902052+++UE5+Release-5.8")));
+
+	TestEqual(TEXT("name sanitised"), SanitiseName(TEXT("../before fix:1")), FString(TEXT("_before_fix_1")));
+	TestEqual(TEXT("empty name -> default"), SanitiseName(TEXT("  ")), FString(TEXT("default")));
+
+	// JSON round trip keeps everything Compare reads.
+	const FSnapshot S = MakeCaptureSnapshot();
+	FSnapshot Back;
+	TestTrue (TEXT("round trip parses"), FromJson(ToJson(S), Back));
+	TestEqual(TEXT("round trip: kind"), Back.Kind, S.Kind);
+	TestEqual(TEXT("round trip: scenario"), Back.Scenario, S.Scenario);
+	TestEqual(TEXT("round trip: identity"), Back.Identity.Num(), S.Identity.Num());
+	TestEqual(TEXT("round trip: metrics"), Back.Metrics.Num(), S.Metrics.Num());
+	TestTrue (TEXT("round trip: compares equal"), Compare(S, Back, false).Mismatches.IsEmpty());
+	TestFalse(TEXT("not a baseline -> false"), FromJson(MakeShared<FJsonObject>(), Back));
 	return true;
 }
 

@@ -23,6 +23,9 @@ from Python with no C++ required. Run everything here from the editor's Python c
 > Stopping PIE only *requests* the end; the teardown happens on the next engine tick. So stop the
 > session, end your Python call / MCP request so the engine can tick, and start the next session in a
 > new call. (Before v1.0.1, starting a standalone in the same call as a PIE stop crashed the editor.)
+| `save_baseline(name="default", scenario="", source="capture", file="")` | Save a run as a named baseline in `Saved/BoundHound/baselines/<name>.json`. See [Baseline + diff](#-baseline--diff). |
+| `compare_baseline(name="default", source="capture", file="", force=False)` | Compare a run against a saved baseline: factual deltas, what changed beyond noise, verdict change. |
+| `list_baselines()` | The saved baselines (name, kind, scenario, created, verdict, map). |
 | `report(title, source="both", file="")` | Render a **self-contained HTML report** from the live verdict/budget + the most recent capture (frame stats, worst frames, PSO hitches) with a data-driven "fix in this order" list, to `Saved/BoundHound/report_<ts>.html`. See [The HTML report](#-the-html-report-report). |
 
 All methods return a JSON string. For a representative reading, profile under PIE or a standalone
@@ -281,6 +284,49 @@ which never sends the stat names to Unreal Insights, so in a `.utrace` they're o
 > **90 s+** before stopping if you want steady-state numbers. A shorter capture is still fine for
 > *demonstrating* the startup hitch (it's exactly what a warm PIE run hides), just not for hot-path
 > averages.
+
+## 📏 Baseline + diff
+
+The optimisation loop: capture, change something, capture again, and see what moved.
+
+```python
+# 1. Capture the scenario and save it as the baseline
+start_standalone("arena", "", 1920, 1080)   # ...play the scenario...
+stop_standalone()
+save_baseline("arena_before", "Arena wave 3, 2 min from spawn")   # source="capture", the last trace
+
+# 2. Make the change, capture the same scenario again, compare
+start_standalone("arena", "", 1920, 1080)   # ...same scenario...
+stop_standalone()
+compare_baseline("arena_before")
+```
+
+```jsonc
+{
+  "comparable": true,
+  "summary": [ "GPU median 9.75 -> 11.02 ms (+1.27 ms, +13.0%)", "PSO hitches 6 -> 8 (+2)" ],
+  "deltas": [ { "metric": "gpu_median_ms", "baseline": 9.75, "current": 11.02, "delta": 1.27, "delta_pct": 13.0, "changed": true }, ... ],
+  "bound_baseline": "GPU", "bound_current": "GPU", "bound_changed": false,
+  "mismatches": [], "warnings": [],
+  "scenario_note": "Scenario 'Arena wave 3, 2 min from spawn' is the label given when the baseline was saved. BoundHound doesn't verify the current run did the same work."
+}
+```
+
+- **What a baseline holds.** A capture baseline: average / p95 / worst frame, each thread's median and
+  p95 (from the run's CSV), spike events, PSO hitches and log errors, plus the run's verdict. And what it
+  ran on, read from the run's own log: engine version, platform, build config, project, RHI, GPU, CPU,
+  device profile, resolution, map, and frame cap. A `live` baseline is one `frame_timing` frame (noisy;
+  for quick checks only).
+- **Factual deltas only.** BoundHound reports what moved, never why. `changed` means beyond run-to-run
+  noise: at least 0.1 ms and 3% for a capture (10% for a live frame), any change for counts.
+- **Refuses mismatched setups.** A different engine version, platform, build config, project or kind
+  (capture vs live) means the numbers measure different things: `BASELINE_MISMATCH`, with the
+  `mismatches` listed. Pass `force=True` to compare anyway (with a warning). A different GPU, resolution,
+  map, frame cap or scenario label still compares, with a warning each.
+- **The scenario is your claim.** BoundHound can't know two runs did the same work; a baseline names
+  the scenario you gave it, and the comparison repeats that as your claim. Two runs of different work
+  give meaningless deltas, so fix the resolution (`res_x` / `res_y`) and play the same route.
+- With a frame cap, the average / p95 frame measure the cap: compare the thread medians.
 
 ## 📄 The HTML report (`report`)
 
