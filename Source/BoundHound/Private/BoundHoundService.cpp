@@ -852,12 +852,16 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 			TEXT("# Ship a bundled PSO cache + keep precaching on (default):\nr.PSOPrecache.GlobalShaders 1\n# Then async-stream the opening level so the first frame isn't a hard stall."),
 			BoundHoundDocs::PsoPrecache, TEXT("PSO Precaching — UE 5.8 docs") });
 	}
-	// A warming-up or repeated frame's verdict is noise (issue #23: a PIE start-up frame got the run labelled
-	// GPU-bound), so it doesn't get to drive a fix. An editor-viewport frame still does -- it's a real frame.
-	const bool bVerdictUsable = !bWarming && !bRepeatRead;
+	// Only a fresh, settled PIE frame gets to drive the bound fix. A warming-up or repeated frame is noise
+	// (issue #23: a PIE start-up frame got the run labelled GPU-bound), and an editor-viewport frame measures
+	// the editor, not the game. Instead, tell the reader how to get a usable verdict.
+	const bool bVerdictUsable = bInProcRepresentative;
 	if (!bVerdictUsable)
 	{
-		// no bound-driven fix
+		Fixes.Add({ TEXT("Get a usable CPU-vs-GPU verdict first"),
+			FString::Printf(TEXT("The in-process frame isn't representative (%s), so this report doesn't say which thread bounds your game."), *InProcCaveat),
+			TEXT("# In separate calls, so frames can advance between them:\nstart_pie()\n# ...wait ~10 s for PIE to settle, park in a representative spot...\nframe_timing()\nreport(...)"),
+			BoundHoundDocs::Profiling, TEXT("Performance Profiling — UE 5.8 docs") });
 	}
 	else if (Bound == TEXT("GameThread"))
 	{
@@ -939,8 +943,10 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 		H += FString::Printf(TEXT("<div class=\"tile %s\"><p class=\"k\">Frame</p><p class=\"v\">%.1f<small>ms</small></p><p class=\"s\">%.0f fps live%s%s</p></div>"),
 			!bVerdictUsable ? TEXT("") : (FrameMs > BudgetMs ? TEXT("crit") : TEXT("good")), FrameMs, Fps,
 			bVerdictUsable ? TEXT("") : TEXT(" &middot; "), bVerdictUsable ? TEXT("") : *BHHtmlEscape(InProcCaveat));
-		H += FString::Printf(TEXT("<div class=\"tile %s\"><p class=\"k\">Bound</p><p class=\"v\" style=\"font-size:22px\">%s</p><p class=\"s\">%s confidence</p></div>"),
-			ConfClass(Conf), *BHHtmlEscape(Bound.IsEmpty() ? TEXT("—") : Bound), *BHHtmlEscape(Conf));
+		H += FString::Printf(TEXT("<div class=\"tile %s\"><p class=\"k\">Bound</p><p class=\"v\" style=\"font-size:22px\">%s</p><p class=\"s\">%s</p></div>"),
+			bVerdictUsable ? ConfClass(Conf) : TEXT(""),
+			*BHHtmlEscape(!bVerdictUsable || Bound.IsEmpty() ? TEXT("n/a") : Bound),
+			*BHHtmlEscape(bVerdictUsable ? Conf + TEXT(" confidence") : FString(TEXT("not your game's frame"))));
 		H += FString::Printf(TEXT("<div class=\"tile %s\"><p class=\"k\">Budget @ %.0f fps</p><p class=\"v\" style=\"font-size:22px\">%s</p><p class=\"s\">%.2f ms/frame budget</p></div>"),
 			bMeets ? TEXT("good") : TEXT("crit"), TargetFps, bMeets ? TEXT("PASS") : TEXT("FAIL"), BudgetMs);
 	}
@@ -969,7 +975,7 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 			? FString::Printf(TEXT("<b>%.1f ms</b> &middot; %s &middot; %.0f fps"), FrameMs, *BHHtmlEscape(Bound.IsEmpty() ? TEXT("—") : Bound), Fps)
 			: FString::Printf(TEXT("<span class=\"tag warn\">not representative</span> %s"), *BHHtmlEscape(InProcCaveat));
 		H += FString::Printf(TEXT("<tr class=\"bound\"><td class=\"dim\">Steady-state frame<small>hot path</small></td><td class=\"warm\">%s</td><td class=\"cold\"><b>p95 %.0f ms</b> &middot; avg <b>%.1f fps</b> &middot; %d frames</td><td class=\"rec-cell\">%s</td></tr>"),
-			*WarmSteady, P95Ms, AvgFps, FrameCount, bVerdictUsable ? SteadyRec : TEXT("Re-sample once PIE has settled for a usable in-process verdict"));
+			*WarmSteady, P95Ms, AvgFps, FrameCount, bVerdictUsable ? SteadyRec : TEXT("Take an in-process reading in settled PIE for the bound verdict (see the fix list)"));
 		H += FString::Printf(TEXT("<tr><td class=\"dim\">Render thread<small>attribution</small></td><td class=\"warm\">Reads <b>%.1f ms</b> in-process</td><td class=\"cold\">Captured per-frame in the trace</td><td class=\"rec-cell\">Use a representative trace for render / RHI attribution — in-process render time is not shipping-accurate</td></tr>"),
 			RenderMs);
 		H += TEXT("<tr><td class=\"dim\">Bound verdict<small>CPU vs GPU</small></td><td class=\"warm\">Live — <code>FrameTiming</code> / <code>ForceHitch</code> self-measure</td><td class=\"cold\">Read via trace + <code>Analyse</code></td><td class=\"rec-cell\">In-process for the fast verdict + hitch self-validation; representative for <i>where</i> the ms goes</td></tr>");

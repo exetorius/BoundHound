@@ -186,8 +186,8 @@ r = json.loads(unreal.BoundHoundService.report("Proteus perf", "both"))
 What it contains:
 - **Contrast tiles** — the warm in-process frame next to the capture's cold worst-frame and steady-state p95.
   The in-process frame is only shown and compared when it's a fresh, settled PIE frame. If PIE is still
-  warming up, the read is a repeat, or PIE isn't running, the tile says why (`n/a`), and that frame's
-  verdict doesn't drive a fix. The JSON result then has `in_process_representative: false` and an
+  warming up, the read is a repeat, or PIE isn't running, the tile says why (`n/a`). That frame's
+  verdict doesn't drive a fix either; the fix list instead starts with how to get a usable reading. The JSON result then has `in_process_representative: false` and an
   `in_process_caveat`.
 - **An IN-PROCESS vs REPRESENTATIVE matrix** (only when a capture supplies the cold column) — the same
   PIE-hides-it / standalone-catches-it story as [PIE vs Standalone](#-pie-vs-standalone), auto-filled:
