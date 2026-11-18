@@ -121,10 +121,17 @@ public:
 
 	/**
 	 * Launch the game as a separate standalone process with a trace attached (representative readings
-	 * that the editor viewport can't give). Connects back to the editor's Unreal Trace Server.
+	 * that the editor viewport can't give). Writes the trace, its own log and a CSV capture of per-frame
+	 * thread times, all named <Name>_<timestamp>.
+	 * @param Name Run name (spaces/commas become '_').
+	 * @param Channels Trace channels; empty uses the default set.
+	 * @param ResX Window/screen width; 0 keeps the editor's Play settings. Fix it to compare runs.
+	 * @param ResY Window/screen height; 0 derives it from ResX at 16:9 (or keeps the editor's if both are 0).
+	 * @param bFullscreen true launches fullscreen (r.FullScreenMode decides exclusive vs windowed-fullscreen).
 	 */
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "BoundHound|Performance")
-	static FString StartStandalone(const FString& Name = TEXT("standalone_capture"), const FString& Channels = TEXT(""));
+	static FString StartStandalone(const FString& Name = TEXT("standalone_capture"), const FString& Channels = TEXT(""),
+		int32 ResX = 0, int32 ResY = 0, bool bFullscreen = false);
 
 	/** Stop the standalone process and finalise its trace/log. */
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "BoundHound|Performance")
