@@ -278,6 +278,61 @@ namespace BoundHoundVerdict
 		return T;
 	}
 
+	// Issue #26: display arguments for a standalone run, so runs can be compared at a fixed resolution instead
+	// of inheriting the editor's Play window size. Our args go before the editor's on the command line, and
+	// the engine takes the first ResX=/ResY= it finds; the editor only adds -windowed if neither -windowed
+	// nor -fullscreen is already there. One side given -> the other follows at 16:9 (the engine's rule).
+	struct FDisplayArgs
+	{
+		FString Args;        // appended to the standalone command line ("" = inherit the editor's settings)
+		int32 ResX = 0, ResY = 0;
+		FString Mode;        // "fullscreen" | "windowed" | "" (inherited)
+		FString Error;       // non-empty = reject the request
+	};
+
+	static constexpr int32 MIN_RES = 320;
+	static constexpr int32 MAX_RES = 16384;
+
+	inline FDisplayArgs BuildDisplayArgs(int32 ResX, int32 ResY, bool bFullscreen)
+	{
+		FDisplayArgs D;
+		if (ResX < 0 || ResY < 0)
+		{
+			D.Error = TEXT("res_x / res_y must be 0 (inherit) or a positive size.");
+			return D;
+		}
+		if (ResX > 0 && ResY == 0) ResY = FMath::RoundToInt32(ResX * 9.0 / 16.0);
+		if (ResY > 0 && ResX == 0) ResX = FMath::RoundToInt32(ResY * 16.0 / 9.0);
+		if (ResX > 0 && (ResX < MIN_RES || ResY < MIN_RES || ResX > MAX_RES || ResY > MAX_RES))
+		{
+			D.Error = FString::Printf(TEXT("Resolution %dx%d is outside %d..%d."), ResX, ResY, MIN_RES, MAX_RES);
+			return D;
+		}
+		D.ResX = ResX; D.ResY = ResY;
+		if (ResX > 0) D.Args += FString::Printf(TEXT(" -ResX=%d -ResY=%d"), ResX, ResY);
+		if (bFullscreen)       { D.Args += TEXT(" -fullscreen"); D.Mode = TEXT("fullscreen"); }
+		else if (ResX > 0)     { D.Args += TEXT(" -windowed");   D.Mode = TEXT("windowed"); }
+		return D;
+	}
+
+	// Issue #26: read the resolution and window mode a run actually used from its command line (the
+	// "LogInit: Command Line:" log line). First ResX=/ResY= wins, as in the engine.
+	inline bool ParseRunDisplay(const FString& CommandLine, int32& OutResX, int32& OutResY, FString& OutMode)
+	{
+		OutResX = OutResY = 0; OutMode.Reset();
+		auto ValueAfter = [&](const TCHAR* Key) -> int32
+		{
+			const int32 At = CommandLine.Find(Key, ESearchCase::IgnoreCase);
+			return At == INDEX_NONE ? 0 : FCString::Atoi(*CommandLine + At + FCString::Strlen(Key));
+		};
+		OutResX = ValueAfter(TEXT("-ResX="));
+		OutResY = ValueAfter(TEXT("-ResY="));
+		const bool bWindowed = CommandLine.Contains(TEXT("-windowed"), ESearchCase::IgnoreCase);
+		const bool bFull     = CommandLine.Contains(TEXT("-fullscreen"), ESearchCase::IgnoreCase);
+		OutMode = bWindowed ? TEXT("windowed") : (bFull ? TEXT("fullscreen") : TEXT(""));
+		return OutResX > 0 || OutResY > 0 || !OutMode.IsEmpty();
+	}
+
 	// Issue #28: starting a play session while another is running, queued or still ending queues a
 	// RequestPlaySession on top of the teardown and crashes the editor (TOptional IsSet assert). Returns
 	// why the editor is busy, or empty when it's safe to start a new session. Pure so it's testable.

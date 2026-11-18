@@ -2,6 +2,7 @@
 
 #include "BoundHoundService.h"
 #include "BoundHoundVerdict.h"
+#include "BoundHoundDrilldown.h"
 #include "Json.h"
 #include "Misc/Paths.h"
 #include "Misc/FileHelper.h"
@@ -22,6 +23,9 @@
 #include "TraceServices/AnalysisService.h"
 #include "TraceServices/Model/AnalysisSession.h"
 #include "TraceServices/Model/Frames.h"
+#include "TraceServices/Model/TimingProfiler.h"
+#include "TraceServices/Model/Log.h"
+#include "TraceServices/Model/Threads.h"
 #include "RenderTimer.h"       // GGameThreadTime / GRenderThreadTime / GRHIThreadTime (RenderCore)
 #include "RHIGlobals.h"        // RHIGetGPUFrameCycles (RHI)
 
@@ -110,6 +114,119 @@ static FString BuildTraceFilePath(const FString& Name)
 // ---------------------------------------------------------------------------
 
 static FString BoundHint(const FString& Bound); // defined with FrameTiming below
+
+// ---------------------------------------------------------------------------
+// Worst-frame drill-down (issue #25)
+// ---------------------------------------------------------------------------
+
+static constexpr double LOAD_FRAME_MS = 5000.0;  // a frame this long is loading, not gameplay
+static constexpr double SPIKE_FACTOR = 3.0;      // spike = this many times the median frame...
+static constexpr double SPIKE_FLOOR_MS = 33.3;   // ...and at least a dropped 30 fps frame
+static constexpr double LOG_WINDOW_S = 0.05;     // log lines this close to a frame belong to it
+static constexpr int32  MAX_SCOPES = 5;
+static constexpr int32  MAX_LOG_LINES = 8;
+
+// Explains one frame from the trace: its top game-thread scopes by self time, the log lines around it,
+// and the causes those point to. Must be used inside an FAnalysisSessionReadScope.
+class FFrameExplainer
+{
+public:
+	explicit FFrameExplainer(const TraceServices::IAnalysisSession& InSession)
+	{
+		Timing = TraceServices::ReadTimingProfilerProvider(InSession);
+		Log = InSession.ReadProvider<TraceServices::ILogProvider>(TraceServices::GetLogProviderName());
+		if (Timing)
+		{
+			uint32 GameThreadId = 0; bool bFound = false;
+			TraceServices::ReadThreadProvider(InSession).EnumerateThreads([&](const TraceServices::FThreadInfo& T)
+			{
+				if (!bFound && T.Name && FCString::Strcmp(T.Name, TEXT("GameThread")) == 0) { GameThreadId = T.Id; bFound = true; }
+			});
+			bHasGameTimeline = bFound && Timing->GetCpuThreadTimelineIndex(GameThreadId, GameTimeline);
+		}
+	}
+
+	bool HasScopes() const { return bHasGameTimeline; }
+
+	void Explain(double Start, double End, const TSharedPtr<FJsonObject>& Out) const
+	{
+		TArray<FString> ScopeNames;
+		if (bHasGameTimeline)
+		{
+			const TraceServices::ITimingProfilerTimerReader& Timers = Timing->GetTimerReader();
+			TArray<BoundHoundDrilldown::FScopeEvent> Events;
+			Timing->ReadTimeline(GameTimeline, [&](const TraceServices::ITimingProfilerProvider::Timeline& TL)
+			{
+				TL.EnumerateEvents(Start, End, [&](double S, double E, uint32 Depth, const TraceServices::FTimingProfilerEvent& Ev)
+				{
+					uint32 Id = Ev.TimerIndex;
+					if (int32(Id) < 0) Id = Timers.GetOriginalTimerIdFromMetadata(Id); // merge metadata variants
+					Events.Add({ S, E, Depth, Id });
+					return TraceServices::EEventEnumerate::Continue;
+				});
+			});
+			TArray<TSharedPtr<FJsonValue>> ScopeArr;
+			for (const TPair<uint32, double>& T : BoundHoundDrilldown::TopSelfTimes(Events, Start, End, MAX_SCOPES))
+			{
+				const TraceServices::FTimingProfilerTimer* Timer = Timers.GetTimer(T.Key);
+				const FString Name = (Timer && Timer->Name) ? FString(Timer->Name) : FString::Printf(TEXT("timer %u"), T.Key);
+				ScopeNames.Add(Name);
+				TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+				O->SetStringField(TEXT("scope"), Name);
+				O->SetNumberField(TEXT("self_ms"), FMath::RoundToDouble(T.Value * 100.0) / 100.0);
+				ScopeArr.Add(MakeShared<FJsonValueObject>(O));
+			}
+			Out->SetArrayField(TEXT("top_scopes"), ScopeArr);
+		}
+
+		TArray<FString> Lines;
+		if (Log)
+		{
+			Log->EnumerateMessages(Start - LOG_WINDOW_S, End + LOG_WINDOW_S, [&](const TraceServices::FLogMessageInfo& M)
+			{
+				if (!M.Message) return;
+				Lines.Add(FString::Printf(TEXT("%s: %s"), (M.Category && M.Category->Name) ? M.Category->Name : TEXT("Log"), M.Message));
+			});
+		}
+
+		const TArray<BoundHoundDrilldown::FCause> Causes = BoundHoundDrilldown::ClassifyCauses(Lines, ScopeNames);
+		TArray<TSharedPtr<FJsonValue>> CauseArr;
+		for (const BoundHoundDrilldown::FCause& C : Causes)
+		{
+			TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+			O->SetStringField(TEXT("cause"), C.Tag);
+			O->SetStringField(TEXT("why"), C.Why);
+			O->SetStringField(TEXT("lever"), C.Lever);
+			CauseArr.Add(MakeShared<FJsonValueObject>(O));
+		}
+		Out->SetArrayField(TEXT("causes"), CauseArr);
+
+		// Keep the most telling lines first (a cause matched it, or it's a warning/error), then the rest.
+		TArray<TSharedPtr<FJsonValue>> LineArr;
+		auto Telling = [](const FString& L)
+		{
+			const TArray<FString> One = { L };
+			return BoundHoundDrilldown::ClassifyCauses(One, {}).Num() > 0 || L.Contains(TEXT("Warning")) || L.Contains(TEXT("Error"));
+		};
+		for (int32 Pass = 0; Pass < 2 && LineArr.Num() < MAX_LOG_LINES; ++Pass)
+		{
+			for (const FString& L : Lines)
+			{
+				if (LineArr.Num() >= MAX_LOG_LINES) break;
+				if ((Pass == 0) == Telling(L)) LineArr.Add(MakeShared<FJsonValueString>(L.Left(300)));
+			}
+		}
+		Out->SetArrayField(TEXT("log_lines"), LineArr);
+		if (Lines.Num() > LineArr.Num()) Out->SetNumberField(TEXT("log_lines_total"), Lines.Num());
+	}
+
+private:
+	const TraceServices::ITimingProfilerProvider* Timing = nullptr;
+	const TraceServices::ILogProvider* Log = nullptr;
+	uint32 GameTimeline = 0;
+	bool bHasGameTimeline = false;
+};
+
 
 // Issue #22: per-thread split + CPU-vs-GPU verdict for a captured run. StartStandalone runs a CSV-profiler
 // capture alongside the trace and names it after the trace: <Saved>/Profiling/<base>.utrace pairs with
@@ -201,12 +318,63 @@ static void AddThreadSplit(const FString& TraceFile, const TSharedPtr<FJsonObjec
 	Root->SetStringField(TEXT("bound_hint"), Hint);
 }
 
+// Analysing a long capture takes a while (a 1.3 GB, 4-minute trace runs past the 30 s MCP Python timeout),
+// and Report() analyses again after Analyse(). Results are cached per trace, keyed on the trace's and its
+// CSV's size + modified time, so a repeat call -- or a retry after a client timeout, since the first call
+// still finishes in the editor -- returns at once. A re-written file changes the key.
+struct FAnalysisCacheEntry { FString Key; FString Json; };
+static TMap<FString, FAnalysisCacheEntry> GAnalysisCache;
+
+static FString AnalysisCacheKey(const FString& TraceFile)
+{
+	IFileManager& FM = IFileManager::Get();
+	const FString Csv = CsvPathForTrace(TraceFile);
+	return FString::Printf(TEXT("%lld|%s|%lld|%s"),
+		FM.FileSize(*TraceFile), *FM.GetTimeStamp(*TraceFile).ToString(),
+		FM.FileSize(*Csv), *FM.GetTimeStamp(*Csv).ToString());
+}
+
+static FString AnalyseTraceUncached(const FString& TraceFile);
+
 static FString AnalyseTrace(const FString& TraceFile)
 {
 	if (!FPaths::FileExists(TraceFile))
 	{
 		return ErrJson(TEXT("FILE_NOT_FOUND"), FString::Printf(TEXT("Trace file not found: %s"), *TraceFile));
 	}
+	const FString Key = AnalysisCacheKey(TraceFile);
+	if (const FAnalysisCacheEntry* Hit = GAnalysisCache.Find(TraceFile))
+	{
+		if (Hit->Key == Key)
+		{
+			TSharedPtr<FJsonObject> Obj;
+			if (FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Hit->Json), Obj) && Obj.IsValid())
+			{
+				Obj->SetBoolField(TEXT("cached"), true);
+				FString Out;
+				FJsonSerializer::Serialize(Obj.ToSharedRef(), TJsonWriterFactory<>::Create(&Out));
+				return Out;
+			}
+		}
+	}
+
+	const double T0 = FPlatformTime::Seconds();
+	FString Json = AnalyseTraceUncached(TraceFile);
+	TSharedPtr<FJsonObject> Obj;
+	if (FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json), Obj) && Obj.IsValid() && Obj->GetBoolField(TEXT("success")))
+	{
+		Obj->SetNumberField(TEXT("analysis_seconds"), FMath::RoundToDouble((FPlatformTime::Seconds() - T0) * 10.0) / 10.0);
+		Obj->SetBoolField(TEXT("cached"), false);
+		Json.Reset();
+		FJsonSerializer::Serialize(Obj.ToSharedRef(), TJsonWriterFactory<>::Create(&Json));
+		if (GAnalysisCache.Num() >= 16) GAnalysisCache.Reset(); // a session analyses a handful of traces
+		GAnalysisCache.Add(TraceFile, { Key, Json });
+	}
+	return Json;
+}
+
+static FString AnalyseTraceUncached(const FString& TraceFile)
+{
 
 	ITraceServicesModule* TraceModule = FModuleManager::LoadModulePtr<ITraceServicesModule>("TraceServices");
 	if (!TraceModule)
@@ -283,9 +451,10 @@ static FString AnalyseTrace(const FString& TraceFile)
 					Root->SetNumberField(TEXT("p95_frame_ms"), FMath::RoundToFloat(AllMs[P95Idx] * 100.0f) / 100.0f);
 				}
 
-				// Worst 10 frames
+				// Worst 10 frames, each explained (issue #25): its biggest game-thread scopes by self time, the log
+				// lines at that moment, and the causes they point to.
 				TArray<TSharedPtr<FJsonValue>> WorstArr;
-				struct FFrameEntry { double Ms; uint64 Index; double StartTime; };
+				struct FFrameEntry { double Ms; uint64 Index; double StartTime; double EndTime; };
 				TArray<FFrameEntry> Entries;
 				Entries.Reserve((int32)FMath::Min(FrameCount, (uint64)10000));
 				Frames->EnumerateFrames(ETraceFrameType::TraceFrameType_Game, 0, FrameCount,
@@ -294,10 +463,11 @@ static FString AnalyseTrace(const FString& TraceFile)
 						if (F.EndTime <= F.StartTime) return;
 						double Ms = (F.EndTime - F.StartTime) * 1000.0;
 						if (!FMath::IsFinite(Ms) || Ms > 120000.0) return;
-						Entries.Add({ Ms, F.Index, F.StartTime });
+						Entries.Add({ Ms, F.Index, F.StartTime, F.EndTime });
 					});
 				Entries.Sort([](const FFrameEntry& A, const FFrameEntry& B) { return A.Ms > B.Ms; });
 
+				const FFrameExplainer Explainer(*Session);
 				int32 WorstCount = FMath::Min(10, Entries.Num());
 				for (int32 i = 0; i < WorstCount; ++i)
 				{
@@ -305,9 +475,47 @@ static FString AnalyseTrace(const FString& TraceFile)
 					FObj->SetNumberField(TEXT("frame"), (double)Entries[i].Index);
 					FObj->SetNumberField(TEXT("ms"), FMath::RoundToFloat(Entries[i].Ms * 100.0f) / 100.0f);
 					FObj->SetNumberField(TEXT("timestamp"), Entries[i].StartTime);
+					FObj->SetStringField(TEXT("phase"), (Entries[i].Index == 0 || Entries[i].Ms > LOAD_FRAME_MS) ? TEXT("load") : TEXT("run"));
+					Explainer.Explain(Entries[i].StartTime, Entries[i].EndTime, FObj);
 					WorstArr.Add(MakeShared<FJsonValueObject>(FObj));
 				}
 				Root->SetArrayField(TEXT("worst_frames"), WorstArr);
+				if (!Explainer.HasScopes())
+				{
+					Root->SetStringField(TEXT("drilldown_note"), TEXT("No game-thread CPU scopes in this trace (needs the 'cpu' channel), so worst frames carry log lines only."));
+				}
+
+				// Periodic spikes (issue #25): run-phase frames well above the typical frame, merged into events,
+				// checked for a fixed interval -- e.g. GC every ~61 s, which is invisible frame by frame.
+				if (!AllMs.IsEmpty())
+				{
+					const double MedianMs = AllMs[AllMs.Num() / 2]; // AllMs was sorted above
+					const double SpikeMs = FMath::Max(SPIKE_FACTOR * MedianMs, SPIKE_FLOOR_MS);
+					TArray<double> SpikeTimes;
+					for (const FFrameEntry& E : Entries)
+					{
+						if (E.Index != 0 && E.Ms <= LOAD_FRAME_MS && E.Ms >= SpikeMs) SpikeTimes.Add(E.StartTime);
+					}
+					const TArray<double> Merged = BoundHoundDrilldown::MergeSpikes(SpikeTimes);
+					const BoundHoundDrilldown::FPeriodicity P = BoundHoundDrilldown::DetectPeriodicSpikes(Merged);
+					TSharedPtr<FJsonObject> PObj = MakeShared<FJsonObject>();
+					PObj->SetNumberField(TEXT("spike_threshold_ms"), FMath::RoundToDouble(SpikeMs * 100.0) / 100.0);
+					PObj->SetNumberField(TEXT("spike_events"), Merged.Num());
+					PObj->SetBoolField(TEXT("periodic"), P.bPeriodic);
+					if (P.bPeriodic)
+					{
+						PObj->SetNumberField(TEXT("interval_s"), FMath::RoundToDouble(P.IntervalS * 10.0) / 10.0);
+						PObj->SetNumberField(TEXT("matching_spikes"), P.Count);
+						if (!P.Likely.IsEmpty()) PObj->SetStringField(TEXT("likely"), P.Likely);
+					}
+					TArray<TSharedPtr<FJsonValue>> TimesArr;
+					for (int32 i = 0; i < FMath::Min(Merged.Num(), 20); ++i)
+					{
+						TimesArr.Add(MakeShared<FJsonValueNumber>(FMath::RoundToDouble(Merged[i] * 10.0) / 10.0));
+					}
+					PObj->SetArrayField(TEXT("spike_times_s"), TimesArr);
+					Root->SetObjectField(TEXT("spikes"), PObj);
+				}
 			}
 		}
 	}
@@ -358,6 +566,12 @@ static FString AnalyseLogs(const FString& LogFile)
 		TEXT("OutOfMemory"), TEXT("out of memory"),
 	};
 
+	// Issue #25: notable_lines are about the run, not startup. Lines only count once the first frame has
+	// started (first non-zero frame tag in the log prefix), and config/plugin/font setup lines are dropped.
+	bool bRunStarted = false;
+	int32 BootLinesSkipped = 0;
+	FString RunCommandLine;
+
 	for (const FString& Line : Lines)
 	{
 		bool bError   = Line.Contains(TEXT("] Error:"))   || Line.Contains(TEXT(":Error:"));
@@ -366,6 +580,14 @@ static FString AnalyseLogs(const FString& LogFile)
 		if (bWarning) ++WarningCount;
 
 		if (Line.Contains(TEXT("PSO creation hitch"))) ++PSOHitches;
+		if (RunCommandLine.IsEmpty() && Line.Contains(TEXT("LogInit: Command Line:"))) RunCommandLine = Line;
+
+		if (!bRunStarted && BoundHoundDrilldown::LogFrameTag(Line) > 0) bRunStarted = true;
+		if (!bError && (!bRunStarted || BoundHoundDrilldown::IsBootNoise(Line)))
+		{
+			++BootLinesSkipped;
+			continue;
+		}
 
 		bool bNotable = bError;
 		if (!bNotable)
@@ -385,6 +607,18 @@ static FString AnalyseLogs(const FString& LogFile)
 	Root->SetNumberField(TEXT("warnings"), WarningCount);
 	Root->SetNumberField(TEXT("pso_hitches"), PSOHitches);
 	Root->SetArrayField(TEXT("notable_lines"), Notable);
+	Root->SetNumberField(TEXT("startup_lines_skipped"), BootLinesSkipped);
+
+	// Issue #26: the resolution / window mode this run actually used, read from its own command line, so
+	// runs can be checked for comparability.
+	int32 RunResX = 0, RunResY = 0; FString RunMode;
+	if (BoundHoundVerdict::ParseRunDisplay(RunCommandLine, RunResX, RunResY, RunMode))
+	{
+		TSharedPtr<FJsonObject> D = MakeShared<FJsonObject>();
+		if (RunResX > 0 && RunResY > 0) D->SetStringField(TEXT("resolution"), FString::Printf(TEXT("%dx%d"), RunResX, RunResY));
+		if (!RunMode.IsEmpty()) D->SetStringField(TEXT("window_mode"), RunMode);
+		Root->SetObjectField(TEXT("run_display"), D);
+	}
 
 	return OkJson(Root);
 }
@@ -863,7 +1097,8 @@ tbody tr.bound td{background:var(--accent-wash,transparent)}
 .worst{list-style:none;margin:0;padding:0;font-family:var(--mono);font-size:13px}
 .worst li{display:flex;justify-content:space-between;gap:14px;padding:8px 16px;border-bottom:1px solid var(--border);font-variant-numeric:tabular-nums}
 .worst li:last-child{border-bottom:none}
-.worst .fm{color:var(--muted)}
+.worst .fm{color:var(--muted);white-space:nowrap}
+.worst .why{flex:1;color:var(--muted);font-size:13px;overflow-wrap:anywhere}
 footer{margin:28px 2px 0;font-family:var(--mono);font-size:11px;letter-spacing:.03em;color:var(--muted);display:flex;flex-wrap:wrap;gap:6px 18px}
 footer b{color:var(--ink);font-weight:600}
 a:focus-visible,.doc:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
@@ -938,6 +1173,42 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 	const int32 LogErrors  = (int32)Num(Logs, TEXT("errors"));
 	const int32 LogWarnings= (int32)Num(Logs, TEXT("warnings"));
 
+	// Issue #26: the resolution the captured run used (from its own command line), so readers can tell
+	// whether two reports are comparable.
+	const TSharedPtr<FJsonObject> RunDisplay = ObjField(Logs, TEXT("run_display"));
+	FString RunResolution = Str(RunDisplay, TEXT("resolution"));
+	if (!Str(RunDisplay, TEXT("window_mode")).IsEmpty())
+	{
+		RunResolution += (RunResolution.IsEmpty() ? TEXT("") : TEXT(" ")) + Str(RunDisplay, TEXT("window_mode"));
+	}
+
+	// Issue #25: spikes on a fixed interval, and the causes found in run-phase worst frames.
+	const TSharedPtr<FJsonObject> Spikes = ObjField(Trace, TEXT("spikes"));
+	const bool bPeriodic = Spikes.IsValid() && Spikes->GetBoolField(TEXT("periodic"));
+	const int32 PeriodicCount = (int32)Num(Spikes, TEXT("matching_spikes"));
+	const double PeriodicInterval = Num(Spikes, TEXT("interval_s"));
+	const FString PeriodicLikely = Str(Spikes, TEXT("likely"));
+	TMap<FString, TPair<FString, int32>> RunCauses; // cause -> (lever, frames)
+	{
+		const TArray<TSharedPtr<FJsonValue>>* WorstFrames = nullptr;
+		if (Trace.IsValid() && Trace->TryGetArrayField(TEXT("worst_frames"), WorstFrames) && WorstFrames)
+		{
+			for (const TSharedPtr<FJsonValue>& V : *WorstFrames)
+			{
+				const TSharedPtr<FJsonObject> WO = V->AsObject();
+				if (!WO.IsValid() || Str(WO, TEXT("phase")) != TEXT("run")) continue; // load causes fold into the startup fix
+				const TArray<TSharedPtr<FJsonValue>>* CauseArr = nullptr;
+				if (!WO->TryGetArrayField(TEXT("causes"), CauseArr) || !CauseArr) continue;
+				for (const TSharedPtr<FJsonValue>& C : *CauseArr)
+				{
+					const TSharedPtr<FJsonObject> CO = C->AsObject();
+					TPair<FString, int32>& Entry = RunCauses.FindOrAdd(Str(CO, TEXT("cause")), TPair<FString, int32>(Str(CO, TEXT("lever")), 0));
+					++Entry.Value;
+				}
+			}
+		}
+	}
+
 	// Issue #22: a capture with per-thread frame times carries its own verdict (medians over the whole run).
 	// It describes the representative run, so it wins over the single in-process frame.
 	const TSharedPtr<FJsonObject> Split = ObjField(Trace, TEXT("thread_split"));
@@ -996,6 +1267,29 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 		Fixes.Add({ TEXT("GPU bound — render cost"),
 			TEXT("The GPU is the bottleneck. Confirm with the resolution test: r.ScreenPercentage 50 should noticeably raise FPS if truly GPU-bound."),
 			TEXT("ProfileGPU\n# Levers: Virtual Shadow Maps, Lumen GI/reflections, translucency, post-process, ScreenPercentage."),
+			BoundHoundDocs::Insights, TEXT("Unreal Insights — UE 5.8 docs") });
+	}
+	// Issue #25: what the worst gameplay frames were caught doing. A periodic pattern leads, because it is a
+	// stall the player hits again and again.
+	if (bPeriodic)
+	{
+		Fixes.Add({ FString::Printf(TEXT("Spikes every %.1f s%s"), PeriodicInterval, PeriodicLikely.StartsWith(TEXT("garbage")) ? TEXT(" — garbage collection") : TEXT("")),
+			FString::Printf(TEXT("%d spikes landed on a fixed interval. Something scheduled is stalling the game thread, not the content on screen.%s"),
+				PeriodicCount, PeriodicLikely.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" It %s."), *PeriodicLikely.Replace(TEXT("garbage collection: "), TEXT("")))),
+			TEXT("# Confirm in the trace: open the spike frames in Unreal Insights and look for CollectGarbage on the GameThread.\n# Then reduce UObject churn, or spread / move the cost:\ngc.IncrementalBeginDestroyEnabled 1\ngc.TimeBetweenPurgingPendingKillObjects 61.1"),
+			BoundHoundDocs::Insights, TEXT("Unreal Insights — UE 5.8 docs") });
+	}
+	for (const TPair<FString, TPair<FString, int32>>& C : RunCauses)
+	{
+		if (bPeriodic && C.Key == TEXT("garbage_collection")) continue; // already covered by the periodic fix
+		if (C.Key == TEXT("pso_compile") && PsoHitches > 0) continue;  // the PSO fix below covers it
+		if (C.Key == TEXT("hitch_logged")) continue;                    // confirms a stall, explains nothing
+		if (C.Key == TEXT("game_thread_waiting")) continue;             // points at the other causes, isn't one
+		FString Label = C.Key.Replace(TEXT("_"), TEXT(" "));
+		if (!Label.IsEmpty()) Label[0] = FChar::ToUpper(Label[0]);
+		Fixes.Add({ FString::Printf(TEXT("%s in %d of the worst gameplay frames"), *Label, C.Value.Value),
+			TEXT("Found in the trace at the moment these frames spiked (log lines and the game thread's biggest scopes)."),
+			C.Value.Key,
 			BoundHoundDocs::Insights, TEXT("Unreal Insights — UE 5.8 docs") });
 	}
 	if (bHasLogs && PsoHitches > 0)
@@ -1152,21 +1446,43 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 	// Capture summary (trace worst frames + log health), when present
 	if (bHasTrace)
 	{
-		H += FString::Printf(TEXT("<h2>Representative capture &middot; %.0fs &middot; avg %.1f fps</h2>"), DurationS, AvgFps);
+		H += FString::Printf(TEXT("<h2>Representative capture &middot; %.0fs &middot; avg %.1f fps%s</h2>"), DurationS, AvgFps,
+			RunResolution.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" &middot; %s"), *BHHtmlEscape(RunResolution)));
 		const TArray<TSharedPtr<FJsonValue>>* Worst = nullptr;
 		if (Trace->TryGetArrayField(TEXT("worst_frames"), Worst) && Worst)
 		{
+			// Each worst frame with what explains it (issue #25): its first recognised cause and biggest scope.
 			H += TEXT("<div class=\"card\"><ul class=\"worst\">");
 			int32 Shown = 0;
 			for (const TSharedPtr<FJsonValue>& V : *Worst)
 			{
 				const TSharedPtr<FJsonObject> WO = V->AsObject();
 				if (!WO.IsValid()) continue;
-				H += FString::Printf(TEXT("<li><span class=\"fm\">frame %d</span><span>%s ms</span></li>"),
-					(int32)WO->GetNumberField(TEXT("frame")), *FString::FormatAsNumber((int64)WO->GetNumberField(TEXT("ms"))));
+				FString Why;
+				const TArray<TSharedPtr<FJsonValue>>* CauseArr = nullptr;
+				if (WO->TryGetArrayField(TEXT("causes"), CauseArr) && CauseArr && CauseArr->Num() > 0)
+				{
+					Why = Str((*CauseArr)[0]->AsObject(), TEXT("cause")).Replace(TEXT("_"), TEXT(" "));
+				}
+				const TArray<TSharedPtr<FJsonValue>>* ScopeArr = nullptr;
+				if (WO->TryGetArrayField(TEXT("top_scopes"), ScopeArr) && ScopeArr && ScopeArr->Num() > 0)
+				{
+					const TSharedPtr<FJsonObject> S0 = (*ScopeArr)[0]->AsObject();
+					Why += FString::Printf(TEXT("%s%s %.0f ms"), Why.IsEmpty() ? TEXT("") : TEXT(" · "), *Str(S0, TEXT("scope")), Num(S0, TEXT("self_ms")));
+				}
+				H += FString::Printf(TEXT("<li><span class=\"fm\">frame %d%s</span><span class=\"why\">%s</span><span>%s ms</span></li>"),
+					(int32)WO->GetNumberField(TEXT("frame")),
+					Str(WO, TEXT("phase")) == TEXT("load") ? TEXT(" &middot; load") : TEXT(""),
+					*BHHtmlEscape(Why),
+					*FString::FormatAsNumber((int64)WO->GetNumberField(TEXT("ms"))));
 				if (++Shown >= 6) break;
 			}
 			H += TEXT("</ul></div>");
+		}
+		if (bPeriodic)
+		{
+			H += FString::Printf(TEXT("<p class=\"lede\" style=\"margin-top:14px\"><b style=\"color:var(--ink)\">Periodic spikes:</b> %d spikes about every %.1f s%s.</p>"),
+				PeriodicCount, PeriodicInterval, PeriodicLikely.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" &mdash; %s"), *BHHtmlEscape(PeriodicLikely)));
 		}
 		if (bHasLogs)
 		{
@@ -1329,6 +1645,21 @@ FString UBoundHoundService::Analyse(const FString& Source, const FString& File)
 
 	FString TraceFile = File.IsEmpty() ? GLastTraceFilePath : File;
 	FString LogFile   = GLastLogFilePath;
+
+	// A standalone run's files share one name: Saved/Profiling/<base>.utrace, Saved/Logs/<base>.log and
+	// Saved/Profiling/CSV/<base>.csv. Pair them by name rather than "whatever ran last", so an older run (or
+	// one from before an editor restart, which clears the remembered paths) reads its own log.
+	if (File.EndsWith(TEXT(".log"), ESearchCase::IgnoreCase))
+	{
+		LogFile = File;
+		const FString PairedTrace = FPaths::GetPath(FPaths::GetPath(File)) / TEXT("Profiling") / (FPaths::GetBaseFilename(File) + TEXT(".utrace"));
+		TraceFile = FPaths::FileExists(PairedTrace) ? PairedTrace : FString();
+	}
+	else if (!TraceFile.IsEmpty())
+	{
+		const FString PairedLog = FPaths::GetPath(FPaths::GetPath(TraceFile)) / TEXT("Logs") / (FPaths::GetBaseFilename(TraceFile) + TEXT(".log"));
+		if (FPaths::FileExists(PairedLog)) LogFile = PairedLog;
+	}
 	if (LogFile.IsEmpty())
 	{
 		LogFile = ProjectSavedDirAbs() / TEXT("Logs") / (FApp::GetProjectName() + FString(TEXT(".log")));
@@ -1349,12 +1680,14 @@ FString UBoundHoundService::Analyse(const FString& Source, const FString& File)
 	return AnalyseBoth(TraceFile, LogFile);
 }
 
-FString UBoundHoundService::StartStandalone(const FString& Name, const FString& Channels)
+FString UBoundHoundService::StartStandalone(const FString& Name, const FString& Channels, int32 ResX, int32 ResY, bool bFullscreen)
 {
 	if (!GEditor) return ErrJson(TEXT("NO_EDITOR"), TEXT("GEditor not available."));
 	if (GStandaloneRunning) return ErrJson(TEXT("ALREADY_RUNNING"), TEXT("Standalone is already running. Call StopStandalone first."));
 	const FString Busy = PlaySessionBusyReason();
 	if (!Busy.IsEmpty()) return PlaySessionBusyError(Busy);
+	const BoundHoundVerdict::FDisplayArgs Display = BoundHoundVerdict::BuildDisplayArgs(ResX, ResY, bFullscreen);
+	if (!Display.Error.IsEmpty()) return ErrJson(TEXT("BAD_RESOLUTION"), Display.Error);
 
 	// The name goes into file names and a console command, so keep it to one token (no spaces or commas).
 	FString TraceName = Name.IsEmpty() ? TEXT("standalone_capture") : Name;
@@ -1388,6 +1721,7 @@ FString UBoundHoundService::StartStandalone(const FString& Name, const FString& 
 	FString ExtraArgs = FString::Printf(
 		TEXT("-trace=%s -tracefile=\"%s\" -abslog=\"%s\" -ExecCmds=\"CsvProfile StartFile=%s, CsvProfile Start\""),
 		*ChannelSet, *TracePath, *StandaloneLogPath, *CsvBase);
+	ExtraArgs += Display.Args; // issue #26: fixed resolution / window mode, ahead of the editor's own
 
 	FRequestPlaySessionParams P;
 	P.SessionDestination = EPlaySessionDestinationType::NewProcess;
@@ -1409,6 +1743,8 @@ FString UBoundHoundService::StartStandalone(const FString& Name, const FString& 
 	R->SetStringField(TEXT("log_file"),   GLastLogFilePath);
 	R->SetStringField(TEXT("csv_file"),   GLastCsvFilePath);
 	R->SetStringField(TEXT("channels"),   ChannelSet);
+	if (Display.ResX > 0) R->SetStringField(TEXT("resolution"), FString::Printf(TEXT("%dx%d"), Display.ResX, Display.ResY));
+	R->SetStringField(TEXT("window_mode"), Display.Mode.IsEmpty() ? FString(TEXT("editor play settings")) : Display.Mode);
 	R->SetStringField(TEXT("hint"), TEXT("Call StopStandalone when done, then Analyse to read results."));
 	return OkJson(R);
 }

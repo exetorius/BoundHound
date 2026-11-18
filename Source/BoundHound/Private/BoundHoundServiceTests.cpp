@@ -5,6 +5,7 @@
 #if WITH_AUTOMATION_TESTS
 
 #include "BoundHoundVerdict.h"
+#include "BoundHoundDrilldown.h"
 #include "BoundHoundService.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -612,6 +613,155 @@ bool FBoundHoundPercentileTest::RunTest(const FString&)
 	TestEqual(TEXT("p100 is max"), Percentile(V, 1.0), 5.0);
 	TestEqual(TEXT("p0 is min"), Percentile(V, 0.0), 1.0);
 	TestEqual(TEXT("empty -> 0"), Percentile({}, 0.5), 0.0);
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Worst-frame drill-down (issue #25)
+// ---------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundSelfTimeTest,
+	"BoundHound.Drilldown.SelfTime", kBHTestFlags)
+bool FBoundHoundSelfTimeTest::RunTest(const FString&)
+{
+	using namespace BoundHoundDrilldown;
+	// Tick [0,100ms] > { World [10,90] > { GC [20,80] }, Slate [90,95] }. Times in seconds.
+	TArray<FScopeEvent> E = {
+		{ 0.000, 0.100, 0, 1 }, // Tick
+		{ 0.010, 0.090, 1, 2 }, // World
+		{ 0.020, 0.080, 2, 3 }, // GC
+		{ 0.090, 0.095, 1, 4 }, // Slate
+	};
+	const TArray<TPair<uint32, double>> Top = TopSelfTimes(E, 0.0, 0.100, 5);
+	if (!TestEqual(TEXT("4 timers with self time"), Top.Num(), 4)) return false;
+	TestEqual(TEXT("GC leads"), Top[0].Key, 3u);
+	TestTrue (TEXT("GC self = 60 ms"), FMath::IsNearlyEqual(Top[0].Value, 60.0, 0.01));
+	TestTrue (TEXT("World self = 20 ms (80 - 60)"), FMath::IsNearlyEqual(Top[1].Value, 20.0, 0.01) && Top[1].Key == 2u);
+	TestTrue (TEXT("Tick self = 15 ms (100 - 80 - 5)"), FMath::IsNearlyEqual(Top[2].Value, 15.0, 0.01) && Top[2].Key == 1u);
+
+	// Window clipping: only [0.05, 0.10] counts -> GC 30 ms, World 10 ms (its own [0.08,0.09]), Slate 5, Tick 5.
+	const TArray<TPair<uint32, double>> Clipped = TopSelfTimes(E, 0.050, 0.100, 1);
+	TestEqual(TEXT("clip: top N honoured"), Clipped.Num(), 1);
+	TestTrue (TEXT("clip: GC 30 ms"), Clipped.Num() == 1 && FMath::IsNearlyEqual(Clipped[0].Value, 30.0, 0.01));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundCausesTest,
+	"BoundHound.Drilldown.Causes", kBHTestFlags)
+bool FBoundHoundCausesTest::RunTest(const FString&)
+{
+	using namespace BoundHoundDrilldown;
+	auto Tags = [](const TArray<FCause>& C) { TArray<FString> T; for (const FCause& X : C) T.Add(X.Tag); return T; };
+
+	// The field report's 40 ms spikes: one FlushAsyncLoading line at each.
+	const TArray<FString> Field = Tags(ClassifyCauses({ TEXT("LogStreaming: Display: FlushAsyncLoading(209): 1 QueuedPackages") }, {}));
+	TestTrue(TEXT("FlushAsyncLoading -> sync_load"), Field.Contains(TEXT("sync_load")));
+
+	const TArray<FString> Gc = Tags(ClassifyCauses({}, { TEXT("CollectGarbage"), TEXT("UWorld::Tick") }));
+	TestTrue(TEXT("CollectGarbage scope -> garbage_collection"), Gc.Contains(TEXT("garbage_collection")));
+
+	const TArray<FString> Pso = Tags(ClassifyCauses({ TEXT("LogRHI: Warning: PSO creation hitch (12 ms)") }, {}));
+	TestTrue(TEXT("PSO hitch line -> pso_compile"), Pso.Contains(TEXT("pso_compile")));
+
+	const TArray<FString> Many = Tags(ClassifyCauses({ TEXT("LogStreaming: FlushAsyncLoading"), TEXT("LogStreaming: FlushAsyncLoading again") }, { TEXT("FlushAsyncLoading") }));
+	TestEqual(TEXT("each cause once"), Many.Num(), 1);
+
+	TestEqual(TEXT("nothing recognisable -> no causes"), ClassifyCauses({ TEXT("LogTemp: hello") }, { TEXT("UWorld::Tick") }).Num(), 0);
+
+	// Lines from the live Proteus run.
+	TestTrue(TEXT("PSO wait -> pso_compile"), Tags(ClassifyCauses({ TEXT("LogD3D12RHI: Waited for PSO creation for 100.000000ms") }, {})).Contains(TEXT("pso_compile")));
+	TestTrue(TEXT("Niagara runtime compile"), Tags(ClassifyCauses({ TEXT("LogNiagara: Compiling System NiagaraSystem /Game/FX/NS_Pickup took 120 ms") }, {})).Contains(TEXT("niagara_compile")));
+	TestTrue(TEXT("top scope is a wait -> game_thread_waiting"),
+		Tags(ClassifyCauses({}, { TEXT("GameThreadWaitForTask"), TEXT("WaitForTasks") })).Contains(TEXT("game_thread_waiting")));
+	TestFalse(TEXT("a wait that isn't the top scope doesn't count"),
+		Tags(ClassifyCauses({}, { TEXT("UWorld_Tick"), TEXT("WaitForTasks") })).Contains(TEXT("game_thread_waiting")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundPeriodicTest,
+	"BoundHound.Drilldown.PeriodicSpikes", kBHTestFlags)
+bool FBoundHoundPeriodicTest::RunTest(const FString&)
+{
+	using namespace BoundHoundDrilldown;
+	// GC every ~61 s, each spike two consecutive slow frames (merged).
+	const TArray<double> Gc = MergeSpikes({ 75.0, 75.02, 136.1, 136.13, 197.2, 258.2 });
+	TestEqual(TEXT("merged into 4 events"), Gc.Num(), 4);
+	const FPeriodicity P = DetectPeriodicSpikes(Gc);
+	TestTrue (TEXT("periodic"), P.bPeriodic);
+	TestTrue (TEXT("interval ~61 s"), FMath::IsNearlyEqual(P.IntervalS, 61.07, 0.1));
+	TestEqual(TEXT("4 spikes fit"), P.Count, 4);
+	TestTrue (TEXT("named as GC"), P.Likely.StartsWith(TEXT("garbage collection")));
+
+	// The field report had only two mid-run spikes: one gap isn't a pattern.
+	TestFalse(TEXT("2 spikes -> not periodic"), DetectPeriodicSpikes({ 75.0, 136.1 }).bPeriodic);
+
+	// Irregular spikes.
+	TestFalse(TEXT("irregular -> not periodic"), DetectPeriodicSpikes({ 10.0, 14.0, 40.0, 41.5, 90.0 }).bPeriodic);
+
+	// The live Proteus run: a burst of PSO-compile spikes at 70-78 s sits among GC spikes at 78 / 139 / 200 s.
+	// Consecutive gaps are all over the place; the 61 s beat is still there.
+	const FPeriodicity Live = DetectPeriodicSpikes({ 52.4, 70.6, 71.7, 72.7, 73.7, 78.0, 139.1, 200.2 });
+	TestTrue (TEXT("live: periodic despite the burst"), Live.bPeriodic);
+	TestEqual(TEXT("live: 3 spikes on the beat"), Live.Count, 3);
+	TestTrue (TEXT("live: ~61.1 s"), FMath::IsNearlyEqual(Live.IntervalS, 61.1, 0.1));
+	TestTrue (TEXT("live: named as GC"), Live.Likely.StartsWith(TEXT("garbage collection")));
+
+	// Many random spikes: a chance chain of 3 must not count (it explains too few of them).
+	TArray<double> Noisy; for (int32 i = 0; i < 30; ++i) Noisy.Add(7.3 * i + (i % 3) * 2.9);
+	const FPeriodicity NoisyP = DetectPeriodicSpikes(MergeSpikes(Noisy));
+	TestTrue(TEXT("noisy: no chance-chain beat"), !NoisyP.bPeriodic || NoisyP.Count >= 8);
+
+	// Periodic but not GC's interval: no GC label.
+	const FPeriodicity P30 = DetectPeriodicSpikes({ 30.0, 60.0, 90.0, 120.0 });
+	TestTrue (TEXT("30 s cadence periodic"), P30.bPeriodic);
+	TestTrue (TEXT("30 s cadence not labelled GC"), P30.Likely.IsEmpty());
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundLogFilterTest,
+	"BoundHound.Drilldown.LogFilter", kBHTestFlags)
+bool FBoundHoundLogFilterTest::RunTest(const FString&)
+{
+	using namespace BoundHoundDrilldown;
+	TestEqual(TEXT("frame tag parsed"), LogFrameTag(TEXT("[2026.11.18-12.01.23:374][226]LogTemp: x")), 226);
+	TestEqual(TEXT("frame 0 tag"), LogFrameTag(TEXT("[2026.11.18-11.59.02:551][  0]LogConfig: Set CVar")), 0);
+	TestEqual(TEXT("no prefix -> -1"), LogFrameTag(TEXT("LogInit: Command Line: -game")), -1);
+	TestTrue (TEXT("ini timing is boot noise"), IsBootNoise(TEXT("LogInit: Display: Loading VulkanPC ini files took 0.06 seconds")));
+	TestTrue (TEXT("plugin mount is boot noise"), IsBootNoise(TEXT("LogPluginManager: Mounting Engine plugin Foo")));
+	TestFalse(TEXT("streaming flush is evidence"), IsBootNoise(TEXT("LogStreaming: Display: FlushAsyncLoading(209): 1 QueuedPackages")));
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Standalone resolution (issue #26)
+// ---------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundDisplayArgsTest,
+	"BoundHound.Standalone.DisplayArgs", kBHTestFlags)
+bool FBoundHoundDisplayArgsTest::RunTest(const FString&)
+{
+	using namespace BoundHoundVerdict;
+	const FDisplayArgs Inherit = BuildDisplayArgs(0, 0, false);
+	TestTrue(TEXT("0,0,windowed -> inherit (no args)"), Inherit.Args.IsEmpty() && Inherit.Error.IsEmpty() && Inherit.Mode.IsEmpty());
+
+	const FDisplayArgs Fixed = BuildDisplayArgs(1920, 1080, false);
+	TestEqual(TEXT("1080p windowed args"), Fixed.Args, FString(TEXT(" -ResX=1920 -ResY=1080 -windowed")));
+
+	const FDisplayArgs Derived = BuildDisplayArgs(2560, 0, false);
+	TestTrue(TEXT("width only -> 16:9 height"), Derived.ResX == 2560 && Derived.ResY == 1440);
+
+	const FDisplayArgs Full = BuildDisplayArgs(0, 0, true);
+	TestEqual(TEXT("fullscreen at native res"), Full.Args, FString(TEXT(" -fullscreen")));
+	TestEqual(TEXT("fullscreen mode"), Full.Mode, FString(TEXT("fullscreen")));
+
+	TestFalse(TEXT("negative rejected"), BuildDisplayArgs(-1, 0, false).Error.IsEmpty());
+	TestFalse(TEXT("tiny rejected"), BuildDisplayArgs(100, 100, false).Error.IsEmpty());
+
+	int32 X = 0, Y = 0; FString Mode;
+	TestTrue (TEXT("parses a real standalone command line"), ParseRunDisplay(
+		TEXT("LogInit: Command Line: /Game/Maps/L -game -ResX=2560 -ResY=1440 -windowed -WinX=980 -ResX=1920 -ResY=1080"), X, Y, Mode));
+	TestTrue (TEXT("first ResX/ResY wins, like the engine"), X == 2560 && Y == 1440);
+	TestEqual(TEXT("windowed"), Mode, FString(TEXT("windowed")));
 	return true;
 }
 

@@ -6,39 +6,50 @@ UBoundHoundTriageSkill::UBoundHoundTriageSkill()
 {
 	// Shown in ListSkills -- keep it one line so the assistant can decide whether to open the skill.
 	Description = TEXT(
-		"Frame-rate triage & validation with BoundHound: determine whether the game is CPU (game/render) "
-		"or GPU bound BEFORE optimising, gate against an FPS budget, capture Unreal Insights traces, and "
-		"validate the verdict with deliberately forced hitches.");
+		"Frame-rate triage & validation with BoundHound: determine whether the game is CPU (game/render/RHI) "
+		"or GPU bound BEFORE optimising, gate against an FPS budget, capture standalone runs and explain "
+		"their worst frames, and validate the verdict with deliberately forced hitches.");
 
 	// Read via GetSkills -> GetDetails(). This is the strategy the per-tool descriptions can't carry.
 	Instructions = FString(
-		TEXT("BoundHound answers 'am I CPU- or GPU-bound?' and drives Insights traces. All tools return a JSON string.\n")
+		TEXT("BoundHound answers 'am I CPU- or GPU-bound?' and explains hitches. All tools return a JSON string.\n")
 		TEXT("\n")
 		TEXT("# Golden rule\n")
-		TEXT("ALWAYS call frame_timing FIRST. Optimising the GPU is wasted effort if the frame is game- or render-thread bound, and vice-versa. Never start a trace or suggest a fix before you know the `bound` thread.\n")
+		TEXT("Know the `bound` thread BEFORE suggesting a fix. Optimising the GPU is wasted effort if the frame is game-, render- or RHI-thread bound, and vice-versa.\n")
 		TEXT("\n")
-		TEXT("# 1. Triage: frame_timing(target_fps=60)\n")
-		TEXT("Read these fields:\n")
-		TEXT("- `bound`: GameThread | RenderThread | GPU -- the bottleneck thread.\n")
-		TEXT("- `bound_confidence`: clear | moderate | marginal | none. Trust `clear`; be cautious below it.\n")
-		TEXT("- `contested` / `contested_with`: when true the top two threads are within ~10% -- frame-to-frame noise can flip the winner. Treat BOTH as bottlenecks; take several readings or trace both.\n")
-		TEXT("- `gpu_ms == 0`: GPU timing was unavailable, so a CPU verdict is UNCONFIRMED. Confirm with the resolution test: `r.ScreenPercentage 50` should noticeably raise FPS if truly GPU-bound.\n")
-		TEXT("- `budget`: per-thread headroom + PASS/FAIL against target_fps. Gate CI/perf checks on `budget.meets_target`; read each thread's `over_budget` to see which one blew the budget.\n")
-		TEXT("- `pie_running`: if false you are reading the EDITOR viewport, NOT the game. Start PIE (or use start_standalone) and park in a representative/worst spot before trusting numbers.\n")
+		TEXT("# 1. Quick verdict in the editor: frame_timing(target_fps=60)\n")
+		TEXT("Start PIE first (start_pie), wait ~10 s for it to settle, park in a representative spot. Read:\n")
+		TEXT("- `bound`: GameThread | RenderThread | RHIThread | GPU. `bound_confidence`: clear | moderate | marginal | none -- trust `clear`.\n")
+		TEXT("- `contested` / `contested_with`: top two threads within ~10%; treat BOTH as bottlenecks.\n")
+		TEXT("- `repeat_read: true`: no new frame since your last call -- the SAME frame again. Frames only advance between calls: take each sample in its own Python call / MCP request; sleeping inside one call does nothing.\n")
+		TEXT("- `warming: true`: PIE started under ~10 s ago; the frame is shader/PSO-compile noise. Read again later.\n")
+		TEXT("- `pie_running: false`: you are reading the EDITOR viewport, not the game.\n")
+		TEXT("- `gpu_ms == 0`: GPU timing unavailable, so a CPU verdict is unconfirmed; confirm with 'r.ScreenPercentage 50'.\n")
+		TEXT("- `budget`: per-thread headroom + PASS/FAIL against target_fps.\n")
 		TEXT("\n")
-		TEXT("# 2. Act on the verdict\n")
-		TEXT("- bound == GPU: NOW profile the GPU. start_trace(channels 'frame,gpu,cpu') -> reproduce -> stop_trace -> analyse; or 'ProfileGPU'. Levers: shadows (Virtual Shadow Maps), Lumen, translucency, post-process, ScreenPercentage.\n")
-		TEXT("- bound == RenderThread: too many draw calls / primitives or dynamic shadow-casting lights. Check 'stat scenerendering'. Levers: merge/instance meshes, Nanite, cut dynamic lights. Dropping r.ScreenPercentage will NOT help.\n")
-		TEXT("- bound == GameThread: Tick / Blueprint / AI / animation cost. Run 'stat dumpframe -ms=0.5 -root=gamethread' on the PIE world. Levers: throttle Tick, fewer ticking actors/AI, cut expensive BP tick. Dropping r.ScreenPercentage will NOT help.\n")
+		TEXT("# 2. Trustworthy numbers: a standalone run\n")
+		TEXT("PIE reuses the editor's warm shader/PSO caches and hides real stalls. For numbers you'd act on:\n")
+		TEXT("start_standalone(name, '', res_x=1920, res_y=1080) -> let it run 2+ min past the load (cold loads can take 40 s+) -> stop_standalone() -> analyse('both').\n")
+		TEXT("Fix the resolution when you'll compare runs. Only one play session at a time: after stop_pie/stop_standalone, END the call before starting another (else PLAY_SESSION_ACTIVE).\n")
+		TEXT("analyse() on a standalone run returns:\n")
+		TEXT("- `bound`, `bound_confidence`, `thread_split` (median/p95 per thread), `bound_share`: the verdict for the WHOLE run. Prefer it over a PIE frame. `ALTERNATING` in `bound_hint` = the bottleneck moves between threads.\n")
+		TEXT("- `worst_frames[]`: each with `top_scopes` (game-thread self time), `log_lines` and `causes` (garbage_collection, sync_load, pso_compile, shader_compile, niagara_compile, level_streaming, game_thread_waiting) with a `lever` each. game_thread_waiting means look at WHAT it waited for (the other causes), not game code.\n")
+		TEXT("- `spikes.periodic` + `interval_s`: a stall on a fixed beat; ~61 s = garbage collection.\n")
+		TEXT("Long captures take ~30 s+ to analyse and can time out the Python call. The analysis still finishes and is cached: just call analyse() again (`cached: true`).\n")
 		TEXT("\n")
-		TEXT("# 3. Capture a trace for detail\n")
-		TEXT("start_trace -> reproduce the workload -> stop_trace -> analyse('both'). Use bookmark / region_start / region_end to mark points of interest. For a representative reading prefer start_standalone (a separate game process) over the bare editor.\n")
+		TEXT("# 3. Act on the verdict\n")
+		TEXT("- GPU: ProfileGPU / a 'gpu' trace. Levers: Virtual Shadow Maps, Lumen, translucency, post-process, ScreenPercentage.\n")
+		TEXT("- RenderThread: draw calls / primitives / dynamic shadowed lights ('stat scenerendering'). Levers: merge/instance, Nanite, fewer dynamic lights.\n")
+		TEXT("- RHIThread: GPU command submission ('stat rhi'). Levers: fewer draw calls and state changes (instancing / HISM / Nanite).\n")
+		TEXT("- GameThread: Tick / Blueprint / AI / animation ('stat dumpframe -ms=0.5 -root=gamethread' in PIE). Levers: throttle Tick, fewer ticking actors/AI.\n")
+		TEXT("Lowering r.ScreenPercentage only helps a GPU-bound frame.\n")
 		TEXT("\n")
-		TEXT("# 4. Validate the verdict (force_hitch)\n")
-		TEXT("force_hitch deliberately stalls a KNOWN thread so you can confirm frame_timing reports it correctly. Fire it, then call frame_timing on a FOLLOWING frame (thread times reflect the last completed frame) and compare against the response's `expect` field:\n")
-		TEXT("- force_hitch('game', 250)   -> expect bound == GameThread\n")
-		TEXT("- force_hitch('render', 250) -> expect bound == RenderThread\n")
-		TEXT("- force_hitch('both', 250)   -> expect contested == true\n")
-		TEXT("- force_hitch('gpu')         -> expect bound == GPU (scene-dependent; supersamples via r.ScreenPercentage, auto-restored)\n")
-		TEXT("Use frames>1 to sustain the hitch and reproduce jitter rather than a single spike.\n"));
+		TEXT("# 4. Share it: report(title)\n")
+		TEXT("Writes a self-contained HTML report (verdict, thread breakdown, explained worst frames, a 'fix in this order' list with commands + doc links) to Saved/BoundHound/. Run it after a standalone capture so it uses the run's verdict (`bound_source: trace`).\n")
+		TEXT("\n")
+		TEXT("# 5. Validate the verdict: force_hitch\n")
+		TEXT("force_hitch stalls a KNOWN thread and measures the stall itself; check `verdict_matched_expect` in the SAME response (no follow-up frame_timing needed):\n")
+		TEXT("- force_hitch('game', 250) / ('render', 250) / ('both', 250) / ('rhi', 250; needs RHI-threading on)\n")
+		TEXT("- force_hitch('gpu') is the exception: it supersamples via r.ScreenPercentage (auto-restored); call frame_timing in a LATER call and expect bound == GPU.\n")
+		TEXT("Use frames>1 to sustain the hitch and reproduce jitter.\n"));
 }

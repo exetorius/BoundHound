@@ -97,8 +97,8 @@ The incumbents win on *depth* — once you know **where** to look, Insights and 
 | `get_trace_status()` | Whether a trace is active and which channels are enabled. |
 | `bookmark(name)` | Drop a point-in-time bookmark in the active trace. |
 | `region_start(name)` / `region_end(name)` | Begin / end a named region span in the trace. |
-| `analyse(source, file)` | Read back a trace and/or log → frame stats, worst frames, hitches, notable log lines; for a standalone run, also the per-thread split + CPU-vs-GPU verdict for the whole run. |
-| `start_standalone(name, channels)` | Launch the game as a separate standalone process with a trace attached (+ its own timestamped log and a CSV capture of per-frame thread times). |
+| `analyse(source, file)` | Read back a trace and/or log → frame stats, worst frames **explained** (top scopes, log lines, causes like GC / PSO / sync load), periodic spikes (e.g. GC every 61 s); for a standalone run, also the per-thread split + CPU-vs-GPU verdict for the whole run. |
+| `start_standalone(name, channels, res_x, res_y, fullscreen)` | Launch the game as a separate standalone process with a trace attached (+ its own timestamped log and a CSV capture of per-frame thread times), optionally at a fixed resolution / fullscreen so runs are comparable. |
 | `stop_standalone()` / `get_standalone_status()` | Control / inspect the standalone capture. |
 | `start_pie()` / `stop_pie()` | Start/stop **in-process** Play-In-Editor so `frame_timing`/`force_hitch` read a live game world. Quick checks only — see note below. |
 | `report(title, source="both", file="")` | Render a **self-contained HTML "printout"** — the live verdict + budget and (when a capture is available) the frame stats, worst frames and PSO hitches, plus a data-driven "fix in this order" list — to `Saved/BoundHound/report_<ts>.html`. Portable: open in any browser, screenshot, or share. |

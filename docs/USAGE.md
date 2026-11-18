@@ -13,8 +13,8 @@ from Python with no C++ required. Run everything here from the editor's Python c
 | `get_trace_status()` | Whether a trace is active and which channels are enabled. |
 | `bookmark(name)` | Drop a point-in-time bookmark in the active trace. |
 | `region_start(name)` / `region_end(name)` | Begin / end a named region span in the active trace. |
-| `analyse(source="both", file="")` | Read back trace and/or log → frame stats, worst frames, hitches, notable log lines. For a `start_standalone()` run it also returns the **per-thread split and a CPU-vs-GPU verdict** for the whole run (see [Verdict from a standalone run](#verdict-from-a-standalone-run)). |
-| `start_standalone(name, channels)` | Launch the game as a separate standalone process with a trace attached. Writes its trace to `Saved/Profiling/<name>_<YYYYMMDD_HHMMSS>.utrace`, its own log to `Saved/Logs/<name>_<YYYYMMDD_HHMMSS>.log` (`-abslog`), and a CSV-profiler capture with per-frame thread times to `Saved/Profiling/CSV/<name>_<YYYYMMDD_HHMMSS>.csv`, so `analyse` reads this run's files, not the editor's. Spaces and commas in `name` become `_`. The `trace_file` it returns is the file that gets written; `get_standalone_status()` and `stop_standalone()` report the same path. |
+| `analyse(source="both", file="")` | Read back trace and/or log → frame stats, **worst frames explained** (top scopes, log lines, causes), periodic spikes, hitches, notable log lines. For a `start_standalone()` run it also returns the **per-thread split and a CPU-vs-GPU verdict** for the whole run (see [Verdict from a standalone run](#verdict-from-a-standalone-run) and [Why a frame spiked](#why-a-frame-spiked)). `file` can be a trace or a `.log`; a run's trace, log and CSV are paired by name. |
+| `start_standalone(name, channels, res_x=0, res_y=0, fullscreen=False)` | Launch the game as a separate standalone process with a trace attached. `res_x`/`res_y` fix the resolution (one side alone follows at 16:9; `0` keeps the editor's Play settings) and `fullscreen` switches window mode, so runs are comparable; the result echoes `resolution` and `window_mode`. Writes its trace to `Saved/Profiling/<name>_<YYYYMMDD_HHMMSS>.utrace`, its own log to `Saved/Logs/<name>_<YYYYMMDD_HHMMSS>.log` (`-abslog`), and a CSV-profiler capture with per-frame thread times to `Saved/Profiling/CSV/<name>_<YYYYMMDD_HHMMSS>.csv`, so `analyse` reads this run's files, not the editor's. Spaces and commas in `name` become `_`. The `trace_file` it returns is the file that gets written; `get_standalone_status()` and `stop_standalone()` report the same path. |
 | `stop_standalone()` / `get_standalone_status()` | Control / inspect the standalone capture. `stop_standalone()` also returns `trace_file_exists` and `file_size_mb`, or a `trace_warning` if nothing was written. |
 | `start_pie()` / `stop_pie()` | Start/stop **in-process** Play-In-Editor (opens a PIE window in the editor process). Makes `frame_timing`/`force_hitch` read a live game world. See [PIE vs Standalone](#-pie-vs-standalone). |
 
@@ -197,6 +197,54 @@ that CSV next to the trace and adds:
   v1.1.0) get `thread_split.available: false` with a note, and no verdict.
 - `report()` uses this verdict ahead of a single in-process frame (`bound_source: "trace"`).
 
+### Why a frame spiked
+
+Each of the trace's 10 worst frames comes back explained, from what the trace recorded at that moment:
+
+```jsonc
+{
+  "frame": 1052, "ms": 531.71, "timestamp": 74.1, "phase": "run",   // "load" for frame 0 / frames over 5 s
+  "top_scopes": [                                                    // game-thread scopes by SELF time
+    { "scope": "GameThreadWaitForTask", "self_ms": 506.23 },
+    { "scope": "WaitForTasks", "self_ms": 11.95 }
+  ],
+  "causes": [
+    { "cause": "pso_compile", "why": "A pipeline state object was compiled on first use.", "lever": "Keep PSO precaching on and ship a bundled PSO cache ..." },
+    { "cause": "game_thread_waiting", "why": "The game thread spent most of this frame blocked in GameThreadWaitForTask ...", "lever": "..." }
+  ],
+  "log_lines": [ "LogD3D12RHI: Creating RTPSO with 207 shaders (6 cached, 2 new) took 177.80 ms ..." ]
+}
+```
+
+- **`top_scopes`** use self time (a scope minus its children), so the list says where the milliseconds
+  went instead of always naming the root `FEngineLoop::Tick`. Needs the `cpu` channel (on by default).
+- **`log_lines`** are the log messages within 50 ms of the frame, read from the trace's `log` channel
+  (exact timestamps, no clock matching). Lines that explain something come first; `log_lines_total`
+  says how many there were.
+- **`causes`** recognised: `garbage_collection`, `sync_load` (FlushAsyncLoading / synchronous loads),
+  `pso_compile`, `shader_compile`, `niagara_compile`, `level_streaming`, `game_thread_waiting` (the
+  frame's biggest scope is the game thread idling on other work, so look at what it waited for) and
+  `hitch_logged`. Each comes with a `lever` to try.
+
+The trace result also has **`spikes`**: frames well above the typical frame (3× the median and at
+least 33 ms) are merged into events and checked for a fixed beat. A burst of unrelated spikes doesn't
+hide it:
+
+```jsonc
+"spikes": { "spike_threshold_ms": 34.04, "spike_events": 8, "periodic": true, "interval_s": 61.1,
+            "matching_spikes": 3, "likely": "garbage collection: matches gc.TimeBetweenPurgingPendingKillObjects (default 61.1 s)",
+            "spike_times_s": [52.4, 70.6, 71.7, 72.7, 73.7, 78, 139.1, 200.2] }
+```
+
+On the log side, `notable_lines` start once frames are running (config, plugin, font and other
+startup lines are skipped; `startup_lines_skipped` counts them), and `run_display` gives the resolution
+and window mode the run actually used, read from its own command line.
+
+**Long captures take a while to analyse** (a 4-minute, 1.3 GB trace takes ~30 s, longer than the MCP
+Python timeout). The analysis still finishes in the editor and is cached per trace, so call `analyse()`
+again and it returns at once (`cached: true`; `analysis_seconds` says how long the real pass took).
+`report()` uses the same cache.
+
 Why a CSV and not the trace: the engine records these four values with `CSV_CUSTOM_STAT_MINIMAL_GLOBAL`,
 which never sends the stat names to Unreal Insights, so in a `.utrace` they're only unnamed counters.
 
@@ -288,7 +336,7 @@ code and Blueprints:
 - **Profile under PIE or standalone, not the bare editor viewport** — the empty viewport isn't
   representative.
 - **A trace must be active before you bookmark / mark regions.**
-- **Trace files are large** — a ~10 s trace with default channels is 30–50 MB, under `Saved/Profiling/`.
+- **Trace files are large** — a ~10 s trace with default channels is 30–50 MB, and a 4-minute standalone run over 1 GB, under `Saved/Profiling/`.
 
 ## Channel reference
 
