@@ -3,6 +3,12 @@
 #include "BoundHoundService.h"
 #include "BoundHoundVerdict.h"
 #include "BoundHoundDrilldown.h"
+#include "BoundHoundBaseline.h"
+#include "BoundHoundMemory.h"
+#include "ContentStreaming.h"   // texture streaming pool (issue #8)
+#include "RHIStats.h"          // FRHIMemoryStats / FTextureMemoryStats
+#include "DynamicRHI.h"        // RHIGetMemoryStats
+#include "Misc/EngineVersion.h"
 #include "Json.h"
 #include "Misc/Paths.h"
 #include "Misc/FileHelper.h"
@@ -120,8 +126,7 @@ static FString BoundHint(const FString& Bound); // defined with FrameTiming belo
 // ---------------------------------------------------------------------------
 
 static constexpr double LOAD_FRAME_MS = 5000.0;  // a frame this long is loading, not gameplay
-static constexpr double SPIKE_FACTOR = 3.0;      // spike = this many times the median frame...
-static constexpr double SPIKE_FLOOR_MS = 33.3;   // ...and at least a dropped 30 fps frame
+static constexpr int32  MAX_SPIKE_FRAMES = 10;  // spike events explained one by one (issue #31)
 static constexpr double LOG_WINDOW_S = 0.05;     // log lines this close to a frame belong to it
 static constexpr int32  MAX_SCOPES = 5;
 static constexpr int32  MAX_LOG_LINES = 8;
@@ -148,7 +153,9 @@ public:
 
 	bool HasScopes() const { return bHasGameTimeline; }
 
-	void Explain(double Start, double End, const TSharedPtr<FJsonObject>& Out) const
+	// CsvEvents: names from the CSV's EVENTS column at this frame (issue #31). They count as evidence: the CSV
+	// names GC even when the trace has no CollectGarbage scope.
+	void Explain(double Start, double End, const TSharedPtr<FJsonObject>& Out, const TArray<FString>& CsvEvents = {}) const
 	{
 		TArray<FString> ScopeNames;
 		if (bHasGameTimeline)
@@ -189,7 +196,18 @@ public:
 			});
 		}
 
-		const TArray<BoundHoundDrilldown::FCause> Causes = BoundHoundDrilldown::ClassifyCauses(Lines, ScopeNames);
+		TArray<FString> Evidence = Lines;
+		if (CsvEvents.Num() > 0)
+		{
+			TArray<TSharedPtr<FJsonValue>> EvArr;
+			for (const FString& E : CsvEvents)
+			{
+				Evidence.Add(FString::Printf(TEXT("CSVEvent \"%s\""), *E));
+				EvArr.Add(MakeShared<FJsonValueString>(E));
+			}
+			Out->SetArrayField(TEXT("csv_events"), EvArr);
+		}
+		const TArray<BoundHoundDrilldown::FCause> Causes = BoundHoundDrilldown::ClassifyCauses(Evidence, ScopeNames);
 		TArray<TSharedPtr<FJsonValue>> CauseArr;
 		for (const BoundHoundDrilldown::FCause& C : Causes)
 		{
@@ -238,7 +256,30 @@ static FString CsvPathForTrace(const FString& TraceFile)
 	return FPaths::GetPath(TraceFile) / TEXT("CSV") / (FPaths::GetBaseFilename(TraceFile) + TEXT(".csv"));
 }
 
-static void AddThreadSplit(const FString& TraceFile, const TSharedPtr<FJsonObject>& Root)
+// What the trace analysis needs back from the CSV (issue #31): the samples (frame times, for the cap check
+// and the alignment with the trace), the EVENTS column, and the verdict's per-thread medians.
+struct FCsvCapture
+{
+	bool bOk = false;
+	TArray<BoundHoundVerdict::FThreadSample> Samples;
+	BoundHoundVerdict::FCsvThreadColumns Cols;
+	TArray<BoundHoundVerdict::FCsvEvent> Events;
+	BoundHoundVerdict::FTraceVerdict T;
+
+	// The slowest thread's median and its name: the real per-frame work, whatever the frame time says.
+	double BottleneckMedianMs(FString* OutName = nullptr) const
+	{
+		struct { const TCHAR* Name; double Ms; } C[] = {
+			{ TEXT("GameThread"), T.Game.MedianMs }, { TEXT("RenderThread"), T.Render.MedianMs },
+			{ TEXT("RHIThread"), T.bRhiAvailable ? T.Rhi.MedianMs : 0.0 }, { TEXT("GPU"), T.bGpuAvailable ? T.Gpu.MedianMs : 0.0 } };
+		int32 Best = 0;
+		for (int32 i = 1; i < 4; ++i) if (C[i].Ms > C[Best].Ms) Best = i;
+		if (OutName) *OutName = C[Best].Name;
+		return C[Best].Ms;
+	}
+};
+
+static void AddThreadSplit(const FString& TraceFile, const TSharedPtr<FJsonObject>& Root, FCsvCapture& Cap)
 {
 	auto Round2 = [](double V) -> double { return FMath::RoundToDouble(V * 100.0) / 100.0; };
 	TSharedPtr<FJsonObject> Split = MakeShared<FJsonObject>();
@@ -266,15 +307,42 @@ static void AddThreadSplit(const FString& TraceFile, const TSharedPtr<FJsonObjec
 		return;
 	}
 
-	TArray<BoundHoundVerdict::FThreadSample> Samples;
-	BoundHoundVerdict::FCsvThreadColumns Cols;
-	if (!BoundHoundVerdict::ParseCsvThreadSamples(Content, Samples, Cols))
+	if (!BoundHoundVerdict::ParseCsvThreadSamples(Content, Cap.Samples, Cap.Cols, &Cap.Events))
 	{
 		Unavailable(TEXT("The CSV capture has no usable GameThreadTime / RenderThreadTime rows."));
 		return;
 	}
+	// Issue #8: the game process's memory over the run (the CSV profiler records it every frame).
+	{
+		const TMap<FString, TArray<double>> MemCols = BoundHoundMemory::ParseCsvColumns(Content, { TEXT("PhysicalUsedMB"), TEXT("MemoryFreeMB") });
+		const TArray<double>* Used = MemCols.Find(TEXT("PhysicalUsedMB"));
+		const TArray<double>* Free = MemCols.Find(TEXT("MemoryFreeMB"));
+		const BoundHoundMemory::FSeries U = Used ? BoundHoundMemory::SummariseSeries(*Used) : BoundHoundMemory::FSeries();
+		const BoundHoundMemory::FSeries F = Free ? BoundHoundMemory::SummariseSeries(*Free) : BoundHoundMemory::FSeries();
+		if (U.bValid || F.bValid)
+		{
+			TSharedPtr<FJsonObject> M = MakeShared<FJsonObject>();
+			if (U.bValid)
+			{
+				M->SetNumberField(TEXT("process_used_peak_mb"), FMath::RoundToDouble(U.Peak));
+				M->SetNumberField(TEXT("process_used_median_mb"), FMath::RoundToDouble(U.Median));
+				M->SetNumberField(TEXT("process_used_early_mb"), FMath::RoundToDouble(U.EarlyMB));
+				M->SetNumberField(TEXT("process_used_late_mb"), FMath::RoundToDouble(U.LateMB));
+				M->SetNumberField(TEXT("growth_mb"), FMath::RoundToDouble(U.GrowthMB));
+				M->SetBoolField(TEXT("notable_growth"), BoundHoundMemory::IsNotableGrowth(U));
+			}
+			if (F.bValid) M->SetNumberField(TEXT("system_free_min_mb"), FMath::RoundToDouble(F.Min));
+			M->SetStringField(TEXT("note"), BoundHoundMemory::IsNotableGrowth(U)
+				? FString::Printf(TEXT("The game's memory grew %.0f MB from early in the run (25-35%% in) to the end. Steady growth through gameplay points at a leak or an unbounded cache: compare 'memreport -full' at two points, or run with -llm."), U.GrowthMB)
+				: FString(TEXT("The game process's memory over the captured run (CSV PhysicalUsedMB / MemoryFreeMB). growth_mb = end of run minus early run (25-35% in, past the load).")));
+			Root->SetObjectField(TEXT("memory_over_run"), M);
+		}
+	}
+	Content.Empty();
 
-	const BoundHoundVerdict::FTraceVerdict T = BoundHoundVerdict::ClassifyTrace(Samples);
+	Cap.T = BoundHoundVerdict::ClassifyTrace(Cap.Samples);
+	Cap.bOk = true;
+	const BoundHoundVerdict::FTraceVerdict& T = Cap.T;
 	auto ThreadObj = [&](const BoundHoundVerdict::FThreadStats& S)
 	{
 		TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
@@ -316,6 +384,29 @@ static void AddThreadSplit(const FString& TraceFile, const TSharedPtr<FJsonObjec
 		Hint += TEXT(" NOTE: no GPU timing was recorded, so a GPU bottleneck can't be ruled out.");
 	}
 	Root->SetStringField(TEXT("bound_hint"), Hint);
+}
+
+// Issue #31: the CSV's EVENTS column, summarised: each event name, how often it fired and when (seconds from
+// the capture's start). GC shows up here even when the trace has no CollectGarbage scope.
+static void AddCsvEventSummary(const FCsvCapture& Csv, const TSharedPtr<FJsonObject>& Root)
+{
+	if (!Csv.bOk || Csv.Events.IsEmpty()) return;
+	TMap<FString, TArray<double>> ByName;
+	for (const BoundHoundVerdict::FCsvEvent& E : Csv.Events) ByName.FindOrAdd(E.Name).Add(E.TimeS);
+	ByName.ValueSort([](const TArray<double>& A, const TArray<double>& B) { return A.Num() > B.Num(); });
+	TArray<TSharedPtr<FJsonValue>> Arr;
+	for (const TPair<FString, TArray<double>>& KV : ByName)
+	{
+		if (Arr.Num() >= 15) break;
+		TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetStringField(TEXT("name"), KV.Key);
+		O->SetNumberField(TEXT("count"), KV.Value.Num());
+		TArray<TSharedPtr<FJsonValue>> Times;
+		for (int32 i = 0; i < FMath::Min(KV.Value.Num(), 20); ++i) Times.Add(MakeShared<FJsonValueNumber>(FMath::RoundToDouble(KV.Value[i] * 10.0) / 10.0));
+		O->SetArrayField(TEXT("times_s"), Times);
+		Arr.Add(MakeShared<FJsonValueObject>(O));
+	}
+	Root->SetArrayField(TEXT("csv_events"), Arr);
 }
 
 // Analysing a long capture takes a while (a 1.3 GB, 4-minute trace runs past the 30 s MCP Python timeout),
@@ -398,6 +489,11 @@ static FString AnalyseTraceUncached(const FString& TraceFile)
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetStringField(TEXT("trace_file"), TraceFile);
 
+	// The CSV capture first: its frame times and events feed the spike analysis below (issue #31).
+	FCsvCapture Csv;
+	AddThreadSplit(TraceFile, Root, Csv);
+	AddCsvEventSummary(Csv, Root);
+
 	{
 		TraceServices::FAnalysisSessionReadScope Scope(*Session);
 		Root->SetNumberField(TEXT("duration_seconds"), Session->GetDurationSeconds());
@@ -465,6 +561,32 @@ static FString AnalyseTraceUncached(const FString& TraceFile)
 						if (!FMath::IsFinite(Ms) || Ms > 120000.0) return;
 						Entries.Add({ Ms, F.Index, F.StartTime, F.EndTime });
 					});
+
+				// Issue #31: line the CSV up with the trace's frames, so a trace frame can be matched with the CSV's
+				// EVENTS at that frame (GC, FlushAsyncLoading...).
+				int32 CsvOffset = INDEX_NONE;
+				if (Csv.bOk && Csv.Cols.bFrame)
+				{
+					TArray<double> TraceMsByIndex;
+					TraceMsByIndex.SetNumZeroed((int32)FMath::Min(FrameCount, (uint64)MAX_int32));
+					for (const FFrameEntry& E : Entries) if (E.Index < (uint64)TraceMsByIndex.Num()) TraceMsByIndex[(int32)E.Index] = E.Ms;
+					TArray<double> CsvMs;
+					CsvMs.Reserve(Csv.Samples.Num());
+					for (const BoundHoundVerdict::FThreadSample& S : Csv.Samples) CsvMs.Add(S.FrameMs);
+					double AlignErr = 0.0;
+					CsvOffset = BoundHoundDrilldown::AlignCsvToTrace(TraceMsByIndex, CsvMs, &AlignErr);
+					TSharedPtr<FJsonObject> AObj = MakeShared<FJsonObject>();
+					AObj->SetBoolField(TEXT("aligned"), CsvOffset != INDEX_NONE);
+					if (CsvOffset != INDEX_NONE) AObj->SetNumberField(TEXT("trace_frame_of_first_csv_row"), CsvOffset);
+					AObj->SetNumberField(TEXT("mean_error_ms"), FMath::RoundToDouble(AlignErr * 100.0) / 100.0);
+					Root->SetObjectField(TEXT("csv_alignment"), AObj);
+				}
+				auto CsvEventsAt = [&](uint64 FrameIndex) -> TArray<FString>
+				{
+					if (CsvOffset == INDEX_NONE || Csv.Events.IsEmpty()) return {};
+					return BoundHoundDrilldown::CsvEventsNear(Csv.Events, (int32)((int64)FrameIndex - CsvOffset));
+				};
+
 				Entries.Sort([](const FFrameEntry& A, const FFrameEntry& B) { return A.Ms > B.Ms; });
 
 				const FFrameExplainer Explainer(*Session);
@@ -476,7 +598,7 @@ static FString AnalyseTraceUncached(const FString& TraceFile)
 					FObj->SetNumberField(TEXT("ms"), FMath::RoundToFloat(Entries[i].Ms * 100.0f) / 100.0f);
 					FObj->SetNumberField(TEXT("timestamp"), Entries[i].StartTime);
 					FObj->SetStringField(TEXT("phase"), (Entries[i].Index == 0 || Entries[i].Ms > LOAD_FRAME_MS) ? TEXT("load") : TEXT("run"));
-					Explainer.Explain(Entries[i].StartTime, Entries[i].EndTime, FObj);
+					Explainer.Explain(Entries[i].StartTime, Entries[i].EndTime, FObj, CsvEventsAt(Entries[i].Index));
 					WorstArr.Add(MakeShared<FJsonValueObject>(FObj));
 				}
 				Root->SetArrayField(TEXT("worst_frames"), WorstArr);
@@ -485,12 +607,41 @@ static FString AnalyseTraceUncached(const FString& TraceFile)
 					Root->SetStringField(TEXT("drilldown_note"), TEXT("No game-thread CPU scopes in this trace (needs the 'cpu' channel), so worst frames carry log lines only."));
 				}
 
+				// Issue #31: a frame-rate cap (t.MaxFPS / VSync) pins the frame time, so frame stats measure the cap,
+				// not the game. Detected from the CSV: frames sit on one value well above the slowest thread.
+				BoundHoundVerdict::FFrameCap Cap;
+				FString BottleneckName;
+				double BottleneckMs = 0.0;
+				if (Csv.bOk)
+				{
+					BottleneckMs = Csv.BottleneckMedianMs(&BottleneckName);
+					TArray<double> FrameSeries;
+					if (Csv.Cols.bFrame) { FrameSeries.Reserve(Csv.Samples.Num()); for (const BoundHoundVerdict::FThreadSample& S : Csv.Samples) FrameSeries.Add(S.FrameMs); }
+					else FrameSeries = AllMs;
+					Cap = BoundHoundVerdict::DetectFrameCap(FrameSeries, BottleneckMs);
+					TSharedPtr<FJsonObject> CObj = MakeShared<FJsonObject>();
+					CObj->SetBoolField(TEXT("capped"), Cap.bCapped);
+					CObj->SetNumberField(TEXT("frame_median_ms"), FMath::RoundToDouble(Cap.FrameMedianMs * 100.0) / 100.0);
+					CObj->SetStringField(TEXT("bottleneck"), BottleneckName);
+					CObj->SetNumberField(TEXT("bottleneck_median_ms"), FMath::RoundToDouble(BottleneckMs * 100.0) / 100.0);
+					if (Cap.bCapped)
+					{
+						CObj->SetNumberField(TEXT("cap_fps"), Cap.CapFps);
+						CObj->SetNumberField(TEXT("cap_budget_ms"), FMath::RoundToDouble(Cap.BudgetMs * 100.0) / 100.0);
+						CObj->SetNumberField(TEXT("headroom_ms"), FMath::RoundToDouble(Cap.HeadroomMs * 100.0) / 100.0);
+						CObj->SetStringField(TEXT("note"), FString::Printf(
+							TEXT("Frame-rate capped at %d fps (t.MaxFPS, VSync or a frame-rate limit setting): avg_fps / p95_frame_ms measure the cap, not the game. The real work is the %s median, %.2f ms, leaving %.2f ms headroom in the %.2f ms cap budget (~%.0f fps of work). Uncap (t.MaxFPS 0, r.VSync 0) to measure the game's own frame rate."),
+							Cap.CapFps, *BottleneckName, BottleneckMs, Cap.HeadroomMs, Cap.BudgetMs, BottleneckMs > 0.0 ? 1000.0 / BottleneckMs : 0.0));
+					}
+					Root->SetObjectField(TEXT("frame_cap"), CObj);
+				}
+
 				// Periodic spikes (issue #25): run-phase frames well above the typical frame, merged into events,
 				// checked for a fixed interval -- e.g. GC every ~61 s, which is invisible frame by frame.
 				if (!AllMs.IsEmpty())
 				{
 					const double MedianMs = AllMs[AllMs.Num() / 2]; // AllMs was sorted above
-					const double SpikeMs = FMath::Max(SPIKE_FACTOR * MedianMs, SPIKE_FLOOR_MS);
+					const double SpikeMs = BoundHoundVerdict::SpikeThresholdMs(MedianMs, Cap, BottleneckMs);
 					TArray<double> SpikeTimes;
 					for (const FFrameEntry& E : Entries)
 					{
@@ -500,6 +651,40 @@ static FString AnalyseTraceUncached(const FString& TraceFile)
 					const BoundHoundDrilldown::FPeriodicity P = BoundHoundDrilldown::DetectPeriodicSpikes(Merged);
 					TSharedPtr<FJsonObject> PObj = MakeShared<FJsonObject>();
 					PObj->SetNumberField(TEXT("spike_threshold_ms"), FMath::RoundToDouble(SpikeMs * 100.0) / 100.0);
+					PObj->SetStringField(TEXT("spike_threshold_basis"), Cap.bCapped
+						? FString::Printf(TEXT("capped run: 3x the %s median, at least one dropped frame at the %d fps cap"), *BottleneckName, Cap.CapFps)
+						: FString(TEXT("3x the median frame, at least 33.3 ms")));
+
+					// Issue #31: explain each spike event's worst frame. The worst-frames list is usually all load
+					// frames, so a mid-run GC hitch would otherwise never be explained. Worst events first, then
+					// listed in time order.
+					TArray<const FFrameEntry*> EventWorst;
+					for (int32 m = 0; m < FMath::Min(Merged.Num(), 200); ++m)
+					{
+						for (const FFrameEntry& E : Entries) // sorted worst first
+						{
+							if (E.Index != 0 && E.Ms <= LOAD_FRAME_MS && E.Ms >= SpikeMs && E.StartTime >= Merged[m] && E.StartTime < Merged[m] + 1.0)
+							{
+								EventWorst.Add(&E);
+								break;
+							}
+						}
+					}
+					EventWorst.Sort([](const FFrameEntry& A, const FFrameEntry& B) { return A.Ms > B.Ms; });
+					if (EventWorst.Num() > MAX_SPIKE_FRAMES) EventWorst.SetNum(MAX_SPIKE_FRAMES);
+					EventWorst.Sort([](const FFrameEntry& A, const FFrameEntry& B) { return A.StartTime < B.StartTime; });
+					TArray<TSharedPtr<FJsonValue>> SpikeFrameArr;
+					for (const FFrameEntry* E : EventWorst)
+					{
+						TSharedPtr<FJsonObject> FObj = MakeShared<FJsonObject>();
+						FObj->SetNumberField(TEXT("frame"), (double)E->Index);
+						FObj->SetNumberField(TEXT("ms"), FMath::RoundToFloat(E->Ms * 100.0f) / 100.0f);
+						FObj->SetNumberField(TEXT("timestamp"), E->StartTime);
+						FObj->SetStringField(TEXT("phase"), TEXT("run"));
+						Explainer.Explain(E->StartTime, E->EndTime, FObj, CsvEventsAt(E->Index));
+						SpikeFrameArr.Add(MakeShared<FJsonValueObject>(FObj));
+					}
+					PObj->SetArrayField(TEXT("spike_frames"), SpikeFrameArr);
 					PObj->SetNumberField(TEXT("spike_events"), Merged.Num());
 					PObj->SetBoolField(TEXT("periodic"), P.bPeriodic);
 					if (P.bPeriodic)
@@ -520,7 +705,6 @@ static FString AnalyseTraceUncached(const FString& TraceFile)
 		}
 	}
 
-	AddThreadSplit(TraceFile, Root);
 	return OkJson(Root);
 }
 
@@ -571,6 +755,7 @@ static FString AnalyseLogs(const FString& LogFile)
 	bool bRunStarted = false;
 	int32 BootLinesSkipped = 0;
 	FString RunCommandLine;
+	TMap<FString, FString> RunMetadata;
 
 	for (const FString& Line : Lines)
 	{
@@ -581,6 +766,10 @@ static FString AnalyseLogs(const FString& LogFile)
 
 		if (Line.Contains(TEXT("PSO creation hitch"))) ++PSOHitches;
 		if (RunCommandLine.IsEmpty() && Line.Contains(TEXT("LogInit: Command Line:"))) RunCommandLine = Line;
+		{
+			FString MetaKey, MetaValue; // issue #6: what the run ran on, from the CSV profiler's metadata lines
+			if (BoundHoundBaseline::ParseMetadataLine(Line, MetaKey, MetaValue)) RunMetadata.Add(MetaKey.ToLower(), MetaValue);
+		}
 
 		if (!bRunStarted && BoundHoundDrilldown::LogFrameTag(Line) > 0) bRunStarted = true;
 		if (!bError && (!bRunStarted || BoundHoundDrilldown::IsBootNoise(Line)))
@@ -618,6 +807,15 @@ static FString AnalyseLogs(const FString& LogFile)
 		if (RunResX > 0 && RunResY > 0) D->SetStringField(TEXT("resolution"), FString::Printf(TEXT("%dx%d"), RunResX, RunResY));
 		if (!RunMode.IsEmpty()) D->SetStringField(TEXT("window_mode"), RunMode);
 		Root->SetObjectField(TEXT("run_display"), D);
+	}
+
+	// Issue #6: what this run ran on (engine, platform, config, GPU, resolution, map...), for baselines.
+	const TMap<FString, FString> RunIdentity = BoundHoundBaseline::IdentityFromMetadata(RunMetadata);
+	if (RunIdentity.Num() > 0)
+	{
+		TSharedPtr<FJsonObject> Id = MakeShared<FJsonObject>();
+		for (const TPair<FString, FString>& KV : RunIdentity) Id->SetStringField(KV.Key, KV.Value);
+		Root->SetObjectField(TEXT("run_identity"), Id);
 	}
 
 	return OkJson(Root);
@@ -676,6 +874,46 @@ static FString BoundHint(const FString& Bound)
 	}
 	return TEXT("CPU game-thread bound. Usual cause: Tick / Blueprint / AI / animation cost. Run 'stat dumpframe -ms=0.5 -root=gamethread' on the PIE world then read the result. Levers: throttle/disable unnecessary Tick, reduce ticking actors & AI, cut expensive Blueprint tick logic. NOTE: dropping r.ScreenPercentage will NOT help a game-thread-bound frame.");
 }
+
+// ---------------------------------------------------------------------------
+// Memory / VRAM (issue #8)
+// ---------------------------------------------------------------------------
+
+static constexpr double BYTES_PER_MB = 1024.0 * 1024.0;
+
+// This process's memory, the machine's RAM, VRAM against the OS/driver budget, and the texture streaming pool.
+static BoundHoundMemory::FMemReading ReadMemory()
+{
+	BoundHoundMemory::FMemReading R;
+	const FPlatformMemoryStats Mem = FPlatformMemory::GetStats();
+	R.TotalPhysicalMB = FPlatformMemory::GetConstants().TotalPhysical / BYTES_PER_MB;
+	R.AvailablePhysicalMB = Mem.AvailablePhysical / BYTES_PER_MB;
+	R.ProcessUsedMB = Mem.UsedPhysical / BYTES_PER_MB;
+	R.ProcessPeakMB = Mem.PeakUsedPhysical / BYTES_PER_MB;
+	if (GDynamicRHI)
+	{
+		FRHIMemoryStats V;
+		RHIGetMemoryStats(V);
+		if (V.IsValid())
+		{
+			R.bVramValid = true;
+			R.VramBudgetMB = V.BudgetLocal / BYTES_PER_MB;
+			R.VramUsedMB = V.UsedLocal / BYTES_PER_MB;
+			R.VramDemotedMB = V.DemotedLocal / BYTES_PER_MB;
+		}
+	}
+	if (IStreamingManager::Get().IsTextureStreamingEnabled())
+	{
+		const IRenderAssetStreamingManager& TS = IStreamingManager::Get().GetTextureStreamingManager();
+		R.bStreamingValid = TS.GetPoolSize() > 0;
+		R.PoolMB = TS.GetPoolSize() / BYTES_PER_MB;
+		R.RequiredPoolMB = TS.GetRequiredPoolSize() / BYTES_PER_MB;
+		R.OverBudgetMB = FMath::Max<int64>(TS.GetMemoryOverBudget(), 0) / BYTES_PER_MB;
+	}
+	return R;
+}
+
+static double RoundMB(double V) { return FMath::RoundToDouble(V); }
 
 FString UBoundHoundService::FrameTiming(float TargetFPS)
 {
@@ -818,6 +1056,26 @@ FString UBoundHoundService::FrameTiming(float TargetFPS)
 	if (GpuMs <= 0.0)
 	{
 		R->SetStringField(TEXT("gpu_note"), TEXT("gpu_ms is 0 (GPU timing unavailable this frame) -- rely on the game vs render comparison, and confirm GPU-bound with the r.ScreenPercentage 50 test."));
+	}
+
+	// Issue #8: a one-line memory check next to the compute verdict, so obvious memory pressure shows up
+	// on the first call. MemStats has the full reading.
+	{
+		const BoundHoundMemory::FMemReading Mem = ReadMemory();
+		const TArray<BoundHoundMemory::FPressure> Pressure = BoundHoundMemory::ClassifyMemory(Mem);
+		TSharedPtr<FJsonObject> M = MakeShared<FJsonObject>();
+		M->SetStringField(TEXT("pressure"), BoundHoundMemory::OverallPressure(Pressure));
+		M->SetNumberField(TEXT("process_used_mb"), RoundMB(Mem.ProcessUsedMB));
+		if (Mem.bVramValid)
+		{
+			M->SetNumberField(TEXT("vram_used_mb"), RoundMB(Mem.VramUsedMB));
+			M->SetNumberField(TEXT("vram_budget_mb"), RoundMB(Mem.VramBudgetMB));
+		}
+		TArray<TSharedPtr<FJsonValue>> Tags;
+		for (const BoundHoundMemory::FPressure& P : Pressure) Tags.Add(MakeShared<FJsonValueString>(P.Tag));
+		M->SetArrayField(TEXT("issues"), Tags);
+		if (Pressure.Num() > 0) M->SetStringField(TEXT("hint"), Pressure[0].Why + TEXT(" Call mem_stats() for the full reading."));
+		R->SetObjectField(TEXT("memory"), M);
 	}
 	return OkJson(R);
 }
@@ -1134,7 +1392,8 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 	const TSharedPtr<FJsonObject>* TracePtr = nullptr;
 	const TSharedPtr<FJsonObject>* LogsPtr  = nullptr;
 	if (AN.IsValid()) { AN->TryGetObjectField(TEXT("trace"), TracePtr); AN->TryGetObjectField(TEXT("logs"), LogsPtr); }
-	const TSharedPtr<FJsonObject> Trace = TracePtr ? *TracePtr : nullptr;
+	// Source "trace" returns the trace result itself, not nested under "trace".
+	const TSharedPtr<FJsonObject> Trace = TracePtr ? *TracePtr : ((AN.IsValid() && AN->HasField(TEXT("trace_file"))) ? AN : nullptr);
 	const TSharedPtr<FJsonObject> Logs  = LogsPtr  ? *LogsPtr  : nullptr;
 
 	const double GameMs   = Num(FT, TEXT("game_thread_ms"));
@@ -1189,14 +1448,24 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 	const double PeriodicInterval = Num(Spikes, TEXT("interval_s"));
 	const FString PeriodicLikely = Str(Spikes, TEXT("likely"));
 	TMap<FString, TPair<FString, int32>> RunCauses; // cause -> (lever, frames)
+	// Issue #31: spike frames (one per spike event) count too, so a mid-run GC hitch is explained even when
+	// the worst-frames list is all load frames. A frame in both lists counts once.
+	TArray<TSharedPtr<FJsonValue>> ExplainedFrames;
 	{
-		const TArray<TSharedPtr<FJsonValue>>* WorstFrames = nullptr;
-		if (Trace.IsValid() && Trace->TryGetArrayField(TEXT("worst_frames"), WorstFrames) && WorstFrames)
+		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+		if (Trace.IsValid() && Trace->TryGetArrayField(TEXT("worst_frames"), Arr) && Arr) ExplainedFrames.Append(*Arr);
+		if (Spikes.IsValid() && Spikes->TryGetArrayField(TEXT("spike_frames"), Arr) && Arr) ExplainedFrames.Append(*Arr);
+	}
+	{
+		TSet<int32> Seen;
 		{
-			for (const TSharedPtr<FJsonValue>& V : *WorstFrames)
+			for (const TSharedPtr<FJsonValue>& V : ExplainedFrames)
 			{
 				const TSharedPtr<FJsonObject> WO = V->AsObject();
 				if (!WO.IsValid() || Str(WO, TEXT("phase")) != TEXT("run")) continue; // load causes fold into the startup fix
+				bool bAlready = false;
+				Seen.Add((int32)Num(WO, TEXT("frame")), &bAlready);
+				if (bAlready) continue;
 				const TArray<TSharedPtr<FJsonValue>>* CauseArr = nullptr;
 				if (!WO->TryGetArrayField(TEXT("causes"), CauseArr) || !CauseArr) continue;
 				for (const TSharedPtr<FJsonValue>& C : *CauseArr)
@@ -1208,6 +1477,18 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 			}
 		}
 	}
+
+	// Issue #31: a frame-rate-capped run. Its frame stats (avg fps, p95) measure the cap, not the game.
+	const TSharedPtr<FJsonObject> FrameCap = ObjField(Trace, TEXT("frame_cap"));
+	const bool bCapped = FrameCap.IsValid() && FrameCap->GetBoolField(TEXT("capped"));
+	const int32 CapFps = (int32)Num(FrameCap, TEXT("cap_fps"));
+	const double CapHeadroomMs = Num(FrameCap, TEXT("headroom_ms"));
+	const double CapBottleneckMs = Num(FrameCap, TEXT("bottleneck_median_ms"));
+	const FString CapBottleneck = Str(FrameCap, TEXT("bottleneck"));
+	const FString CapSentence = bCapped
+		? FString::Printf(TEXT("Capped at %d fps: frame stats show the cap. Headroom = %.1f ms (the %.1f ms budget minus the %s median, %.1f ms)."),
+			CapFps, CapHeadroomMs, Num(FrameCap, TEXT("cap_budget_ms")), *CapBottleneck, CapBottleneckMs)
+		: FString();
 
 	// Issue #22: a capture with per-thread frame times carries its own verdict (medians over the whole run).
 	// It describes the representative run, so it wins over the single in-process frame.
@@ -1288,9 +1569,26 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 		FString Label = C.Key.Replace(TEXT("_"), TEXT(" "));
 		if (!Label.IsEmpty()) Label[0] = FChar::ToUpper(Label[0]);
 		Fixes.Add({ FString::Printf(TEXT("%s in %d of the worst gameplay frames"), *Label, C.Value.Value),
-			TEXT("Found in the trace at the moment these frames spiked (log lines and the game thread's biggest scopes)."),
+			TEXT("Found at the moment these frames spiked: the trace's log lines and biggest game-thread scopes, and the CSV capture's events."),
 			C.Value.Key,
 			BoundHoundDocs::Insights, TEXT("Unreal Insights — UE 5.8 docs") });
+	}
+	// Issue #8: memory. Growth through the captured run (the game alone), and pressure in this process.
+	const TSharedPtr<FJsonObject> MemRun = ObjField(Trace, TEXT("memory_over_run"));
+	if (MemRun.IsValid() && MemRun->GetBoolField(TEXT("notable_growth")))
+	{
+		Fixes.Add({ FString::Printf(TEXT("Memory grew %.0f MB during the run"), Num(MemRun, TEXT("growth_mb"))),
+			Str(MemRun, TEXT("note")),
+			TEXT("memreport -full\n# ...play on, then again, and diff the two reports\n# or launch with -llm and read the LLM CSV / 'stat llmfull'"),
+			BoundHoundDocs::Profiling, TEXT("Performance Profiling — UE 5.8 docs") });
+	}
+	const TSharedPtr<FJsonObject> LiveMem = ObjField(FT, TEXT("memory"));
+	if (LiveMem.IsValid() && Str(LiveMem, TEXT("pressure")) != TEXT("none") && !Str(LiveMem, TEXT("pressure")).IsEmpty())
+	{
+		Fixes.Add({ TEXT("Memory pressure in this process"),
+			Str(LiveMem, TEXT("hint")) + TEXT(" (Read from the editor process, PIE included: confirm in a standalone run.)"),
+			TEXT("stat RHI\nstat streaming\nmemreport -full"),
+			BoundHoundDocs::Profiling, TEXT("Performance Profiling — UE 5.8 docs") });
 	}
 	if (bHasLogs && PsoHitches > 0)
 	{
@@ -1332,12 +1630,21 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 		}
 		H += FString::Printf(TEXT("<div class=\"tile crit\"><p class=\"k\">Worst frame (cold)</p><p class=\"v\">%s<small>ms</small></p><p class=\"s\">The frame-0 stall the warm reading hid.</p></div>"),
 			*FString::FormatAsNumber((int64)MaxFrameMs));
-		const FString RatioText = bInProcRepresentative ? BoundHoundVerdict::DescribeRatio(P95Ms, FrameMs) : FString();
-		const FString SteadySub = RatioText.IsEmpty()
-			? FString::Printf(TEXT("avg %.1f fps over the capture."), AvgFps)
-			: FString::Printf(TEXT("%s the %.1f ms in-process frame."), *RatioText, FrameMs);
-		H += FString::Printf(TEXT("<div class=\"tile %s\"><p class=\"k\">Steady-state (p95)</p><p class=\"v\">%.0f<small>ms</small></p><p class=\"s\">%s</p></div>"),
-			P95Ms > BudgetMs ? TEXT("crit") : TEXT("good"), P95Ms, *BHHtmlEscape(SteadySub));
+		if (bCapped)
+		{
+			// The p95 is the cap; the bottleneck's median is the game's real per-frame work.
+			H += FString::Printf(TEXT("<div class=\"tile %s\"><p class=\"k\">Real work (capped at %d fps)</p><p class=\"v\">%.1f<small>ms</small></p><p class=\"s\">%s Frame p95 %.0f ms.</p></div>"),
+				CapHeadroomMs < 0.0 ? TEXT("crit") : TEXT("good"), CapFps, CapBottleneckMs, *BHHtmlEscape(CapSentence), P95Ms);
+		}
+		else
+		{
+			const FString RatioText = bInProcRepresentative ? BoundHoundVerdict::DescribeRatio(P95Ms, FrameMs) : FString();
+			const FString SteadySub = RatioText.IsEmpty()
+				? FString::Printf(TEXT("avg %.1f fps over the capture."), AvgFps)
+				: FString::Printf(TEXT("%s the %.1f ms in-process frame."), *RatioText, FrameMs);
+			H += FString::Printf(TEXT("<div class=\"tile %s\"><p class=\"k\">Steady-state (p95)</p><p class=\"v\">%.0f<small>ms</small></p><p class=\"s\">%s</p></div>"),
+				P95Ms > BudgetMs ? TEXT("crit") : TEXT("good"), P95Ms, *BHHtmlEscape(SteadySub));
+		}
 	}
 	else
 	{
@@ -1375,8 +1682,11 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 		const FString WarmSteady = bInProcRepresentative
 			? FString::Printf(TEXT("<b>%.1f ms</b> &middot; %s &middot; %.0f fps"), FrameMs, *BHHtmlEscape(LiveBound.IsEmpty() ? TEXT("—") : LiveBound), Fps)
 			: FString::Printf(TEXT("<span class=\"tag warn\">not representative</span> %s"), *BHHtmlEscape(InProcCaveat));
-		H += FString::Printf(TEXT("<tr class=\"bound\"><td class=\"dim\">Steady-state frame<small>hot path</small></td><td class=\"warm\">%s</td><td class=\"cold\"><b>p95 %.0f ms</b> &middot; avg <b>%.1f fps</b> &middot; %d frames</td><td class=\"rec-cell\">%s</td></tr>"),
-			*WarmSteady, P95Ms, AvgFps, FrameCount, bVerdictUsable ? SteadyRec : TEXT("No usable bound verdict yet (see the fix list)"));
+		const FString CapCell = bCapped
+			? FString::Printf(TEXT(" <span class=\"tag warn\">capped %d fps</span><br>%s"), CapFps, *BHHtmlEscape(CapSentence))
+			: FString();
+		H += FString::Printf(TEXT("<tr class=\"bound\"><td class=\"dim\">Steady-state frame<small>hot path</small></td><td class=\"warm\">%s</td><td class=\"cold\"><b>p95 %.0f ms</b> &middot; avg <b>%.1f fps</b> &middot; %d frames%s</td><td class=\"rec-cell\">%s</td></tr>"),
+			*WarmSteady, P95Ms, AvgFps, FrameCount, *CapCell, bVerdictUsable ? SteadyRec : TEXT("No usable bound verdict yet (see the fix list)"));
 		const double CapRenderMed = Num(ObjField(Split, TEXT("render_thread")), TEXT("median_ms"));
 		H += FString::Printf(TEXT("<tr><td class=\"dim\">Render thread<small>attribution</small></td><td class=\"warm\">Reads <b>%.1f ms</b> in-process</td><td class=\"cold\">%s</td><td class=\"rec-cell\">Use a representative trace for render / RHI attribution — in-process render time is not shipping-accurate</td></tr>"),
 			RenderMs, *(bTraceVerdict ? FString::Printf(TEXT("Median <b>%.1f ms</b> over the run"), CapRenderMed) : FString(TEXT("Not recorded in this capture"))));
@@ -1446,18 +1756,37 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 	// Capture summary (trace worst frames + log health), when present
 	if (bHasTrace)
 	{
-		H += FString::Printf(TEXT("<h2>Representative capture &middot; %.0fs &middot; avg %.1f fps%s</h2>"), DurationS, AvgFps,
+		H += FString::Printf(TEXT("<h2>Representative capture &middot; %.0fs &middot; avg %.1f fps%s%s</h2>"), DurationS, AvgFps,
+			bCapped ? *FString::Printf(TEXT(" (capped at %d)"), CapFps) : TEXT(""),
 			RunResolution.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" &middot; %s"), *BHHtmlEscape(RunResolution)));
 		const TArray<TSharedPtr<FJsonValue>>* Worst = nullptr;
 		if (Trace->TryGetArrayField(TEXT("worst_frames"), Worst) && Worst)
 		{
 			// Each worst frame with what explains it (issue #25): its first recognised cause and biggest scope.
-			H += TEXT("<div class=\"card\"><ul class=\"worst\">");
-			int32 Shown = 0;
+			// Then the spike frames (issue #31): mid-run hitches that the load frames push out of the worst list.
+			TArray<TSharedPtr<FJsonObject>> ListFrames;
+			TSet<int32> Listed;
 			for (const TSharedPtr<FJsonValue>& V : *Worst)
 			{
 				const TSharedPtr<FJsonObject> WO = V->AsObject();
-				if (!WO.IsValid()) continue;
+				if (!WO.IsValid() || ListFrames.Num() >= 6) continue;
+				ListFrames.Add(WO); Listed.Add((int32)Num(WO, TEXT("frame")));
+			}
+			const TArray<TSharedPtr<FJsonValue>>* SpikeFrames = nullptr;
+			int32 SpikeShown = 0;
+			if (Spikes.IsValid() && Spikes->TryGetArrayField(TEXT("spike_frames"), SpikeFrames) && SpikeFrames)
+			{
+				for (const TSharedPtr<FJsonValue>& V : *SpikeFrames)
+				{
+					const TSharedPtr<FJsonObject> WO = V->AsObject();
+					if (!WO.IsValid() || Listed.Contains((int32)Num(WO, TEXT("frame"))) || SpikeShown >= 4) continue;
+					WO->SetBoolField(TEXT("_spike"), true);
+					ListFrames.Add(WO); ++SpikeShown;
+				}
+			}
+			H += TEXT("<div class=\"card\"><ul class=\"worst\">");
+			for (const TSharedPtr<FJsonObject>& WO : ListFrames)
+			{
 				FString Why;
 				const TArray<TSharedPtr<FJsonValue>>* CauseArr = nullptr;
 				if (WO->TryGetArrayField(TEXT("causes"), CauseArr) && CauseArr && CauseArr->Num() > 0)
@@ -1470,12 +1799,13 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 					const TSharedPtr<FJsonObject> S0 = (*ScopeArr)[0]->AsObject();
 					Why += FString::Printf(TEXT("%s%s %.0f ms"), Why.IsEmpty() ? TEXT("") : TEXT(" · "), *Str(S0, TEXT("scope")), Num(S0, TEXT("self_ms")));
 				}
+				const bool bSpike = WO->HasField(TEXT("_spike"));
 				H += FString::Printf(TEXT("<li><span class=\"fm\">frame %d%s</span><span class=\"why\">%s</span><span>%s ms</span></li>"),
 					(int32)WO->GetNumberField(TEXT("frame")),
-					Str(WO, TEXT("phase")) == TEXT("load") ? TEXT(" &middot; load") : TEXT(""),
+					Str(WO, TEXT("phase")) == TEXT("load") ? TEXT(" &middot; load")
+						: bSpike ? *FString::Printf(TEXT(" &middot; spike @ %.0f s"), Num(WO, TEXT("timestamp"))) : TEXT(""),
 					*BHHtmlEscape(Why),
 					*FString::FormatAsNumber((int64)WO->GetNumberField(TEXT("ms"))));
-				if (++Shown >= 6) break;
 			}
 			H += TEXT("</ul></div>");
 		}
@@ -1483,6 +1813,12 @@ FString UBoundHoundService::Report(const FString& Title, const FString& Source, 
 		{
 			H += FString::Printf(TEXT("<p class=\"lede\" style=\"margin-top:14px\"><b style=\"color:var(--ink)\">Periodic spikes:</b> %d spikes about every %.1f s%s.</p>"),
 				PeriodicCount, PeriodicInterval, PeriodicLikely.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" &mdash; %s"), *BHHtmlEscape(PeriodicLikely)));
+		}
+		if (MemRun.IsValid() && MemRun->HasField(TEXT("process_used_peak_mb")))
+		{
+			H += FString::Printf(TEXT("<p class=\"lede\" style=\"margin-top:14px\"><b style=\"color:var(--ink)\">Memory:</b> game process peak %s MB, %+.0f MB from early run to the end%s.</p>"),
+				*FString::FormatAsNumber((int64)Num(MemRun, TEXT("process_used_peak_mb"))), Num(MemRun, TEXT("growth_mb")),
+				MemRun->HasField(TEXT("system_free_min_mb")) ? *FString::Printf(TEXT(", system RAM free at least %s MB"), *FString::FormatAsNumber((int64)Num(MemRun, TEXT("system_free_min_mb")))) : TEXT(""));
 		}
 		if (bHasLogs)
 		{
@@ -1844,5 +2180,341 @@ FString UBoundHoundService::StopPIE()
 	TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
 	R->SetStringField(TEXT("status"), TEXT("PIE end requested"));
 	R->SetStringField(TEXT("hint"),   TEXT("PIE tears down on the next tick. If you were tracing, StopTrace then Analyse."));
+	return OkJson(R);
+}
+
+// ---------------------------------------------------------------------------
+// Baseline + diff (issue #6)
+// ---------------------------------------------------------------------------
+
+static FString BaselineDir()
+{
+	return ProjectSavedDirAbs() / TEXT("BoundHound") / TEXT("baselines");
+}
+
+static TSharedPtr<FJsonObject> BLParse(const FString& Json)
+{
+	TSharedPtr<FJsonObject> O;
+	return FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json), O) ? O : nullptr;
+}
+static TSharedPtr<FJsonObject> BLObj(const TSharedPtr<FJsonObject>& O, const TCHAR* K)
+{
+	const TSharedPtr<FJsonObject>* P = nullptr;
+	return (O.IsValid() && O->TryGetObjectField(K, P) && P) ? *P : nullptr;
+}
+
+// Build a snapshot of the current run. "capture" = a standalone run's analysis (trace + CSV + log);
+// "live" = the current FrameTiming frame. Returns false with an error JSON in OutError.
+static bool BuildSnapshot(const FString& Source, const FString& File, BoundHoundBaseline::FSnapshot& S, TArray<FString>& Notes, FString& OutError)
+{
+	const FString Kind = Source.IsEmpty() ? FString(TEXT("capture")) : Source.ToLower();
+	S.Kind = Kind;
+	S.Created = FDateTime::UtcNow().ToIso8601();
+
+	if (Kind == TEXT("live"))
+	{
+		const TSharedPtr<FJsonObject> FT = BLParse(UBoundHoundService::FrameTiming(60.0f));
+		if (!FT.IsValid() || !FT->GetBoolField(TEXT("success")))
+		{
+			OutError = ErrJson(TEXT("NO_READING"), TEXT("FrameTiming returned no reading."));
+			return false;
+		}
+		auto Put = [&](const TCHAR* From, const TCHAR* To) { double V = 0.0; if (FT->TryGetNumberField(From, V) && V > 0.0) S.Metrics.Add(To, V); };
+		Put(TEXT("frame_ms"), TEXT("frame_ms"));
+		Put(TEXT("game_thread_ms"), TEXT("game_ms"));
+		Put(TEXT("render_thread_ms"), TEXT("render_ms"));
+		Put(TEXT("rhi_thread_ms"), TEXT("rhi_ms"));
+		Put(TEXT("gpu_ms"), TEXT("gpu_ms"));
+		FT->TryGetStringField(TEXT("bound"), S.Bound);
+		bool bFlag = false;
+		if (FT->TryGetBoolField(TEXT("repeat_read"), bFlag) && bFlag) Notes.Add(TEXT("This frame was a repeat read (no new frame since the last sample)."));
+		if (FT->TryGetBoolField(TEXT("warming"), bFlag) && bFlag) Notes.Add(TEXT("PIE was still warming up: this frame isn't representative."));
+		if (FT->TryGetBoolField(TEXT("pie_running"), bFlag) && !bFlag) Notes.Add(TEXT("PIE isn't running: this frame measures the editor viewport, not the game."));
+
+		S.Identity.Add(TEXT("engineversion"), FEngineVersion::Current().ToString());
+		S.Identity.Add(TEXT("platform"), FPlatformProperties::IniPlatformName());
+		S.Identity.Add(TEXT("config"), LexToString(FApp::GetBuildConfiguration()));
+		S.Identity.Add(TEXT("project"), FApp::GetProjectName());
+		FString Rhi = FApp::GetGraphicsRHI(); // "D3D12 (SM6)"; run logs say "D3D12"
+		Rhi.Split(TEXT(" ("), &Rhi, nullptr);
+		S.Identity.Add(TEXT("rhiname"), Rhi.TrimStartAndEnd());
+		UWorld* World = (GEditor && GEditor->PlayWorld) ? GEditor->PlayWorld.Get() : (GEditor ? GEditor->GetEditorWorldContext().World() : nullptr);
+		if (World) S.Identity.Add(TEXT("map"), UWorld::RemovePIEPrefix(World->GetOutermost()->GetName()));
+		S.Source = TEXT("FrameTiming");
+		return true;
+	}
+	if (Kind != TEXT("capture"))
+	{
+		OutError = ErrJson(TEXT("BAD_SOURCE"), TEXT("Source must be 'capture' or 'live'."));
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject> AN = BLParse(UBoundHoundService::Analyse(TEXT("both"), File));
+	const TSharedPtr<FJsonObject> Trace = BLObj(AN, TEXT("trace"));
+	const TSharedPtr<FJsonObject> Logs = BLObj(AN, TEXT("logs"));
+	if (!Trace.IsValid())
+	{
+		OutError = ErrJson(TEXT("NO_CAPTURE"), TEXT("No capture to read. Run start_standalone / stop_standalone first, or pass File=<trace or log path>."));
+		return false;
+	}
+	if (!Trace->GetBoolField(TEXT("success")))
+	{
+		FString Msg; Trace->TryGetStringField(TEXT("error"), Msg);
+		OutError = ErrJson(TEXT("ANALYSIS_FAILED"), FString::Printf(TEXT("The capture couldn't be analysed: %s"), *Msg));
+		return false;
+	}
+	Trace->TryGetStringField(TEXT("trace_file"), S.Source);
+	auto Put = [&](const TSharedPtr<FJsonObject>& O, const TCHAR* From, const FString& To)
+	{
+		double V = 0.0;
+		if (O.IsValid() && O->TryGetNumberField(From, V)) S.Metrics.Add(To, V);
+	};
+	Put(Trace, TEXT("avg_frame_ms"), TEXT("frame_avg_ms"));
+	Put(Trace, TEXT("p95_frame_ms"), TEXT("frame_p95_ms"));
+	Put(Trace, TEXT("max_frame_ms"), TEXT("worst_frame_ms"));
+	const TSharedPtr<FJsonObject> Split = BLObj(Trace, TEXT("thread_split"));
+	struct FThreadKey { const TCHAR* Obj; const TCHAR* Prefix; };
+	const FThreadKey Threads[] = {
+		{ TEXT("game_thread"), TEXT("game") }, { TEXT("render_thread"), TEXT("render") },
+		{ TEXT("rhi_thread"), TEXT("rhi") }, { TEXT("gpu"), TEXT("gpu") } };
+	for (const FThreadKey& T : Threads)
+	{
+		const TSharedPtr<FJsonObject> O = BLObj(Split, T.Obj);
+		Put(O, TEXT("median_ms"), FString::Printf(TEXT("%s_median_ms"), T.Prefix));
+		Put(O, TEXT("p95_ms"), FString::Printf(TEXT("%s_p95_ms"), T.Prefix));
+	}
+	if (!Split.IsValid() || !Split->GetBoolField(TEXT("available")))
+	{
+		Notes.Add(TEXT("No per-thread times in this capture (no CSV next to the trace): only whole-frame stats are compared."));
+	}
+	Put(BLObj(Trace, TEXT("spikes")), TEXT("spike_events"), TEXT("spike_events"));
+	Put(Logs, TEXT("pso_hitches"), TEXT("pso_hitches"));
+	Put(Logs, TEXT("errors"), TEXT("log_errors"));
+	Trace->TryGetStringField(TEXT("bound"), S.Bound);
+
+	if (const TSharedPtr<FJsonObject> Id = BLObj(Logs, TEXT("run_identity")))
+	{
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& KV : Id->Values) S.Identity.Add(KV.Key, KV.Value->AsString());
+	}
+	else
+	{
+		Notes.Add(TEXT("The run's log has no CSV-profiler metadata, so engine / GPU / resolution can't be checked from the run itself."));
+	}
+	if (const TSharedPtr<FJsonObject> Cap = BLObj(Trace, TEXT("frame_cap")))
+	{
+		S.Identity.Add(TEXT("frame_cap"), Cap->GetBoolField(TEXT("capped")) ? FString::Printf(TEXT("%d"), (int32)Cap->GetNumberField(TEXT("cap_fps"))) : FString(TEXT("uncapped")));
+	}
+	return true;
+}
+
+FString UBoundHoundService::SaveBaseline(const FString& Name, const FString& Scenario, const FString& Source, const FString& File)
+{
+	BoundHoundBaseline::FSnapshot S;
+	TArray<FString> Notes;
+	FString Err;
+	if (!BuildSnapshot(Source, File, S, Notes, Err)) return Err;
+	S.Name = BoundHoundBaseline::SanitiseName(Name);
+	S.Scenario = Scenario.TrimStartAndEnd();
+
+	FString Json;
+	FJsonSerializer::Serialize(BoundHoundBaseline::ToJson(S), TJsonWriterFactory<>::Create(&Json));
+	const FString Path = BaselineDir() / (S.Name + TEXT(".json"));
+	IPlatformFile::GetPlatformPhysical().CreateDirectoryTree(*BaselineDir());
+	const bool bExisted = FPaths::FileExists(Path);
+	if (!FFileHelper::SaveStringToFile(Json, *Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+	{
+		return ErrJson(TEXT("WRITE_FAILED"), FString::Printf(TEXT("Couldn't write %s"), *Path));
+	}
+
+	TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("baseline_file"), Path);
+	R->SetBoolField(TEXT("overwrote"), bExisted);
+	R->SetObjectField(TEXT("baseline"), BoundHoundBaseline::ToJson(S));
+	if (S.Scenario.IsEmpty()) Notes.Add(TEXT("No scenario label given. Name the workload (map, route, duration) so a later comparison can say whether the runs claim to do the same thing."));
+	TArray<TSharedPtr<FJsonValue>> NoteArr;
+	for (const FString& N : Notes) NoteArr.Add(MakeShared<FJsonValueString>(N));
+	R->SetArrayField(TEXT("notes"), NoteArr);
+	R->SetStringField(TEXT("hint"), FString::Printf(TEXT("After your change, capture the same scenario again, then compare_baseline(\"%s\")."), *S.Name));
+	return OkJson(R);
+}
+
+FString UBoundHoundService::CompareBaseline(const FString& Name, const FString& Source, const FString& File, bool bForce)
+{
+	const FString SafeName = BoundHoundBaseline::SanitiseName(Name);
+	const FString Path = BaselineDir() / (SafeName + TEXT(".json"));
+	FString Json;
+	if (!FFileHelper::LoadFileToString(Json, *Path))
+	{
+		return ErrJson(TEXT("NO_BASELINE"), FString::Printf(TEXT("No baseline '%s' (%s). list_baselines() shows the saved ones."), *SafeName, *Path));
+	}
+	BoundHoundBaseline::FSnapshot Base;
+	if (!BoundHoundBaseline::FromJson(BLParse(Json), Base))
+	{
+		return ErrJson(TEXT("BAD_BASELINE"), FString::Printf(TEXT("%s isn't a BoundHound baseline."), *Path));
+	}
+
+	BoundHoundBaseline::FSnapshot Cur;
+	TArray<FString> Notes;
+	FString Err;
+	if (!BuildSnapshot(Source.IsEmpty() ? Base.Kind : Source, File, Cur, Notes, Err)) return Err;
+	if (Base.Kind == TEXT("capture") && !Base.Source.IsEmpty() && Base.Source == Cur.Source)
+	{
+		Notes.Add(TEXT("The current run is the same capture the baseline was saved from: every delta is zero by construction."));
+	}
+
+	const BoundHoundBaseline::FComparison C = BoundHoundBaseline::Compare(Base, Cur, bForce);
+
+	TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("baseline"), SafeName);
+	R->SetStringField(TEXT("baseline_created"), Base.Created);
+	R->SetStringField(TEXT("baseline_source"), Base.Source);
+	R->SetStringField(TEXT("current_source"), Cur.Source);
+	R->SetStringField(TEXT("scenario"), Base.Scenario);
+	R->SetStringField(TEXT("scenario_note"), Base.Scenario.IsEmpty()
+		? FString(TEXT("The baseline has no scenario label. BoundHound can't tell whether the two runs did the same work."))
+		: FString::Printf(TEXT("Scenario '%s' is the label given when the baseline was saved. BoundHound doesn't verify the current run did the same work."), *Base.Scenario));
+
+	TArray<TSharedPtr<FJsonValue>> MisArr;
+	for (const BoundHoundBaseline::FMismatch& M : C.Mismatches)
+	{
+		TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetStringField(TEXT("field"), M.Field);
+		O->SetStringField(TEXT("baseline"), M.Baseline);
+		O->SetStringField(TEXT("current"), M.Current);
+		O->SetStringField(TEXT("severity"), M.bHard ? TEXT("hard") : TEXT("soft"));
+		MisArr.Add(MakeShared<FJsonValueObject>(O));
+	}
+	R->SetArrayField(TEXT("mismatches"), MisArr);
+
+	if (C.bHardMismatch && !bForce)
+	{
+		R->SetBoolField(TEXT("success"), false);
+		R->SetStringField(TEXT("error_code"), TEXT("BASELINE_MISMATCH"));
+		R->SetStringField(TEXT("error"), TEXT("The runs differ in engine version, platform, build config, project or kind, so their numbers measure different things. Save a new baseline for this setup, or pass force=True to compare anyway."));
+		FString Out;
+		FJsonSerializer::Serialize(R.ToSharedRef(), TJsonWriterFactory<>::Create(&Out));
+		return Out;
+	}
+
+	R->SetBoolField(TEXT("comparable"), C.Mismatches.IsEmpty());
+	TArray<TSharedPtr<FJsonValue>> DeltaArr, Summary;
+	for (const BoundHoundBaseline::FDelta& D : C.Deltas)
+	{
+		TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetStringField(TEXT("metric"), D.Key);
+		O->SetNumberField(TEXT("baseline"), FMath::RoundToDouble(D.Baseline * 100.0) / 100.0);
+		O->SetNumberField(TEXT("current"), FMath::RoundToDouble(D.Current * 100.0) / 100.0);
+		O->SetNumberField(TEXT("delta"), FMath::RoundToDouble(D.Delta * 100.0) / 100.0);
+		if (D.Baseline != 0.0) O->SetNumberField(TEXT("delta_pct"), FMath::RoundToDouble(D.DeltaPct * 10.0) / 10.0);
+		O->SetBoolField(TEXT("changed"), D.bChanged);
+		DeltaArr.Add(MakeShared<FJsonValueObject>(O));
+		if (D.bChanged) Summary.Add(MakeShared<FJsonValueString>(D.Statement));
+	}
+	if (C.bBoundChanged)
+	{
+		Summary.Insert(MakeShared<FJsonValueString>(FString::Printf(TEXT("bound verdict %s -> %s"), *Base.Bound, *Cur.Bound)), 0);
+	}
+	if (Summary.IsEmpty()) Summary.Add(MakeShared<FJsonValueString>(TEXT("No metric changed beyond run-to-run noise.")));
+	R->SetArrayField(TEXT("deltas"), DeltaArr);
+	R->SetArrayField(TEXT("summary"), Summary);
+	R->SetStringField(TEXT("bound_baseline"), Base.Bound);
+	R->SetStringField(TEXT("bound_current"), Cur.Bound);
+	R->SetBoolField(TEXT("bound_changed"), C.bBoundChanged);
+	TArray<TSharedPtr<FJsonValue>> WarnArr;
+	for (const FString& W : C.Warnings) WarnArr.Add(MakeShared<FJsonValueString>(W));
+	for (const FString& N : Notes) WarnArr.Add(MakeShared<FJsonValueString>(N));
+	R->SetArrayField(TEXT("warnings"), WarnArr);
+	R->SetStringField(TEXT("note"), TEXT("Factual deltas only: BoundHound doesn't say what caused a change. 'changed' = beyond noise (0.1 ms and 3% for a capture, 10% for a live frame; any change for counts)."));
+	return OkJson(R);
+}
+
+FString UBoundHoundService::ListBaselines()
+{
+	TArray<FString> Files;
+	IFileManager::Get().FindFiles(Files, *(BaselineDir() / TEXT("*.json")), true, false);
+	Files.Sort();
+	TArray<TSharedPtr<FJsonValue>> Arr;
+	for (const FString& F : Files)
+	{
+		FString Json;
+		BoundHoundBaseline::FSnapshot S;
+		if (!FFileHelper::LoadFileToString(Json, *(BaselineDir() / F)) || !BoundHoundBaseline::FromJson(BLParse(Json), S)) continue;
+		TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetStringField(TEXT("name"), FPaths::GetBaseFilename(F));
+		O->SetStringField(TEXT("kind"), S.Kind);
+		O->SetStringField(TEXT("scenario"), S.Scenario);
+		O->SetStringField(TEXT("created"), S.Created);
+		O->SetStringField(TEXT("bound"), S.Bound);
+		if (const FString* Map = S.Identity.Find(TEXT("map"))) O->SetStringField(TEXT("map"), *Map);
+		Arr.Add(MakeShared<FJsonValueObject>(O));
+	}
+	TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("dir"), BaselineDir());
+	R->SetArrayField(TEXT("baselines"), Arr);
+	return OkJson(R);
+}
+
+FString UBoundHoundService::MemStats()
+{
+	const BoundHoundMemory::FMemReading M = ReadMemory();
+	const TArray<BoundHoundMemory::FPressure> Pressure = BoundHoundMemory::ClassifyMemory(M);
+
+	TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+	TSharedPtr<FJsonObject> Sys = MakeShared<FJsonObject>();
+	Sys->SetNumberField(TEXT("total_physical_mb"), RoundMB(M.TotalPhysicalMB));
+	Sys->SetNumberField(TEXT("available_physical_mb"), RoundMB(M.AvailablePhysicalMB));
+	Sys->SetNumberField(TEXT("process_used_mb"), RoundMB(M.ProcessUsedMB));
+	Sys->SetNumberField(TEXT("process_peak_mb"), RoundMB(M.ProcessPeakMB));
+	R->SetObjectField(TEXT("system"), Sys);
+
+	TSharedPtr<FJsonObject> Vram = MakeShared<FJsonObject>();
+	Vram->SetBoolField(TEXT("available"), M.bVramValid);
+	if (M.bVramValid)
+	{
+		Vram->SetNumberField(TEXT("budget_mb"), RoundMB(M.VramBudgetMB));
+		Vram->SetNumberField(TEXT("used_mb"), RoundMB(M.VramUsedMB));
+		Vram->SetNumberField(TEXT("used_pct"), M.VramBudgetMB > 0.0 ? FMath::RoundToDouble(M.VramUsedMB / M.VramBudgetMB * 1000.0) / 10.0 : 0.0);
+		Vram->SetNumberField(TEXT("demoted_mb"), RoundMB(M.VramDemotedMB));
+	}
+	else
+	{
+		Vram->SetStringField(TEXT("note"), TEXT("This RHI doesn't report a VRAM budget (D3D12 does; the null RHI and some others don't)."));
+	}
+	if (GDynamicRHI)
+	{
+		FTextureMemoryStats T;
+		RHIGetTextureMemoryStats(T);
+		if (T.DedicatedVideoMemory > 0) Vram->SetNumberField(TEXT("dedicated_video_mb"), RoundMB(T.DedicatedVideoMemory / BYTES_PER_MB));
+		Vram->SetNumberField(TEXT("streaming_textures_mb"), RoundMB(T.StreamingMemorySize / BYTES_PER_MB));
+		Vram->SetNumberField(TEXT("non_streaming_textures_mb"), RoundMB(T.NonStreamingMemorySize / BYTES_PER_MB));
+	}
+	R->SetObjectField(TEXT("vram"), Vram);
+
+	TSharedPtr<FJsonObject> Stream = MakeShared<FJsonObject>();
+	Stream->SetBoolField(TEXT("available"), M.bStreamingValid);
+	if (M.bStreamingValid)
+	{
+		Stream->SetNumberField(TEXT("pool_mb"), RoundMB(M.PoolMB));
+		Stream->SetNumberField(TEXT("required_mb"), RoundMB(M.RequiredPoolMB));
+		Stream->SetNumberField(TEXT("over_budget_mb"), RoundMB(M.OverBudgetMB));
+	}
+	R->SetObjectField(TEXT("texture_streaming"), Stream);
+
+	TArray<TSharedPtr<FJsonValue>> Arr;
+	for (const BoundHoundMemory::FPressure& P : Pressure)
+	{
+		TSharedPtr<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetStringField(TEXT("issue"), P.Tag);
+		O->SetStringField(TEXT("severity"), P.Severity);
+		O->SetStringField(TEXT("why"), P.Why);
+		O->SetStringField(TEXT("lever"), P.Lever);
+		Arr.Add(MakeShared<FJsonValueObject>(O));
+	}
+	R->SetStringField(TEXT("pressure"), BoundHoundMemory::OverallPressure(Pressure));
+	R->SetArrayField(TEXT("issues"), Arr);
+	R->SetStringField(TEXT("hint"), Pressure.Num() > 0
+		? Pressure[0].Why
+		: FString(TEXT("No memory pressure: VRAM within budget, the streaming pool fits, and system RAM has room.")));
+	R->SetStringField(TEXT("note"), TEXT("This reads the EDITOR process (PIE runs inside it), so process and VRAM numbers include the editor. For the game alone, capture a standalone run: analyse() returns memory_over_run from its CSV."));
 	return OkJson(R);
 }

@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "BoundHoundVerdict.h" // FCsvEvent
 
 // Pure, side-effect-free logic for explaining WHY a captured frame spiked (issue #25): which game-thread
 // scopes ate the time, which log lines fired at that moment, what cause they point to, and whether spikes
@@ -190,6 +191,46 @@ namespace BoundHoundDrilldown
 			P.Likely = TEXT("garbage collection: matches gc.TimeBetweenPurgingPendingKillObjects (default 61.1 s)");
 		}
 		return P;
+	}
+
+	// Issue #31: line up the CSV capture with the trace's frames. The trace starts with the process; the CSV
+	// starts a few frames later (when -ExecCmds runs "CsvProfile Start"), so CSV sample k is trace frame
+	// k + offset. Find the offset by sliding the CSV's first frame times along the trace's and taking the best
+	// match (mean absolute difference). The opening load frames (seconds long, irregular) pin it down even when
+	// the rest of the run is capped flat. Returns INDEX_NONE when nothing matches well enough.
+	static constexpr int32  ALIGN_WINDOW = 600;      // CSV samples compared
+	static constexpr int32  ALIGN_MAX_OFFSET = 5000; // trace frames searched
+	static constexpr double ALIGN_MAX_ERROR = 0.10;  // accepted mean error, as a share of the mean frame time
+
+	inline int32 AlignCsvToTrace(const TArray<double>& TraceFrameMs, const TArray<double>& CsvFrameMs, double* OutMeanErrMs = nullptr)
+	{
+		const int32 Window = FMath::Min(ALIGN_WINDOW, CsvFrameMs.Num());
+		if (Window < 10 || TraceFrameMs.Num() < Window) return INDEX_NONE;
+		double CsvMean = 0.0; for (int32 k = 0; k < Window; ++k) CsvMean += CsvFrameMs[k]; CsvMean /= Window;
+		if (CsvMean <= 0.0) return INDEX_NONE;
+		int32 Best = INDEX_NONE; double BestErr = TNumericLimits<double>::Max();
+		const int32 MaxOffset = FMath::Min(ALIGN_MAX_OFFSET, TraceFrameMs.Num() - Window);
+		for (int32 Off = 0; Off <= MaxOffset; ++Off)
+		{
+			double Err = 0.0;
+			for (int32 k = 0; k < Window && Err < BestErr * Window; ++k) Err += FMath::Abs(TraceFrameMs[Off + k] - CsvFrameMs[k]);
+			Err /= Window;
+			if (Err < BestErr) { BestErr = Err; Best = Off; }
+		}
+		if (OutMeanErrMs) *OutMeanErrMs = BestErr;
+		return BestErr <= ALIGN_MAX_ERROR * CsvMean ? Best : INDEX_NONE;
+	}
+
+	// CSV events recorded within Radius samples of a sample. The engine stamps an event (e.g. GC) on the frame
+	// whose game thread did the work, and the frame-time spike shows a row later, so look either side.
+	inline TArray<FString> CsvEventsNear(const TArray<BoundHoundVerdict::FCsvEvent>& Events, int32 Sample, int32 Radius = 1)
+	{
+		TArray<FString> Out;
+		for (const BoundHoundVerdict::FCsvEvent& E : Events)
+		{
+			if (FMath::Abs(E.Sample - Sample) <= Radius) Out.AddUnique(E.Name);
+		}
+		return Out;
 	}
 
 	// Log lines that are boot noise, not evidence: config/plugin/module/font setup and CSV metadata. Used to

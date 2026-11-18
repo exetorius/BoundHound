@@ -146,6 +146,7 @@ namespace BoundHoundVerdict
 	struct FThreadSample
 	{
 		double GameMs = 0.0, RenderMs = 0.0, RhiMs = 0.0, GpuMs = 0.0;
+		double FrameMs = 0.0; // whole-frame time (CSV FrameTime column; 0 if absent)
 	};
 
 	// Nearest-rank percentile (P in [0,1]) of an unsorted array; 0 for an empty array.
@@ -189,11 +190,32 @@ namespace BoundHoundVerdict
 	// full header is only written at the end (lost when the process is killed). Existing columns never move,
 	// so the first-row header's indices stay valid. Rows shorter than that header are skipped (metadata rows),
 	// as are non-numeric cells (a repeated header) and an unterminated last line (cut short by the kill).
-	struct FCsvThreadColumns { bool bGame = false, bRender = false, bRhi = false, bGpu = false; };
+	struct FCsvThreadColumns { bool bGame = false, bRender = false, bRhi = false, bGpu = false, bFrame = false; };
 
-	inline bool ParseCsvThreadSamples(const FString& Content, TArray<FThreadSample>& Out, FCsvThreadColumns& Cols)
+	// Issue #31: one entry of the CSV's EVENTS column. A cell holds "Name##seconds" entries separated by ';'
+	// (e.g. "GC##58.62"), the seconds counted from the capture's start. Sample = index into the parsed samples.
+	struct FCsvEvent { int32 Sample = 0; FString Name; double TimeS = 0.0; };
+
+	inline void ParseCsvEventCell(const FString& Cell, int32 Sample, TArray<FCsvEvent>& Out)
+	{
+		TArray<FString> Parts;
+		Cell.ParseIntoArray(Parts, TEXT(";"), true);
+		for (const FString& P : Parts)
+		{
+			FCsvEvent E; E.Sample = Sample;
+			FString Time;
+			if (!P.Split(TEXT("##"), &E.Name, &Time)) E.Name = P;
+			else E.TimeS = FCString::Atod(*Time);
+			E.Name.TrimStartAndEndInline();
+			if (!E.Name.IsEmpty()) Out.Add(E);
+		}
+	}
+
+	inline bool ParseCsvThreadSamples(const FString& Content, TArray<FThreadSample>& Out, FCsvThreadColumns& Cols,
+		TArray<FCsvEvent>* OutEvents = nullptr)
 	{
 		Out.Reset();
+		if (OutEvents) OutEvents->Reset();
 		Cols = FCsvThreadColumns();
 		TArray<FString> Lines;
 		Content.ParseIntoArrayLines(Lines);
@@ -205,8 +227,11 @@ namespace BoundHoundVerdict
 		const int32 IRender = Header.IndexOfByKey(TEXT("RenderThreadTime"));
 		const int32 IRhi    = Header.IndexOfByKey(TEXT("RHIThreadTime"));
 		const int32 IGpu    = Header.IndexOfByKey(TEXT("GPUTime"));
+		const int32 IFrame  = Header.IndexOfByKey(TEXT("FrameTime"));
+		const int32 IEvents = Header.IndexOfByKey(TEXT("EVENTS"));
 		Cols.bGame = IGame != INDEX_NONE; Cols.bRender = IRender != INDEX_NONE;
 		Cols.bRhi = IRhi != INDEX_NONE;   Cols.bGpu = IGpu != INDEX_NONE;
+		Cols.bFrame = IFrame != INDEX_NONE;
 		if (!Cols.bGame || !Cols.bRender) return false; // can't rank without both CPU threads
 
 		auto Read = [](const TArray<FString>& Row, int32 Idx, double& OutMs) -> bool
@@ -226,12 +251,64 @@ namespace BoundHoundVerdict
 			Lines[L].ParseIntoArray(Row, TEXT(","), false);
 			if (Row.Num() < Header.Num()) continue; // metadata row
 			FThreadSample S;
-			if (Read(Row, IGame, S.GameMs) && Read(Row, IRender, S.RenderMs) && Read(Row, IRhi, S.RhiMs) && Read(Row, IGpu, S.GpuMs))
+			if (Read(Row, IGame, S.GameMs) && Read(Row, IRender, S.RenderMs) && Read(Row, IRhi, S.RhiMs) && Read(Row, IGpu, S.GpuMs)
+				&& Read(Row, IFrame, S.FrameMs))
 			{
+				if (OutEvents && IEvents != INDEX_NONE && !Row[IEvents].IsEmpty()) ParseCsvEventCell(Row[IEvents], Out.Num(), *OutEvents);
 				Out.Add(S);
 			}
 		}
 		return Out.Num() > 0;
+	}
+
+	// Issue #31: is the run frame-rate limited (t.MaxFPS, VSync, smoothed frame rate)? The CSV's
+	// "targetframerate" metadata can't say: the engine fills it from the display's refresh rate, not the cap.
+	// So read it from the data: frames sit tightly on one value that is well above the slowest thread's
+	// median, so every frame waits for the cap. When it's capped, frame-time stats measure the cap, not the game.
+	struct FFrameCap
+	{
+		bool   bCapped = false;
+		double FrameMedianMs = 0.0;
+		int32  CapFps = 0;          // 1000 / frame median, rounded
+		double BudgetMs = 0.0;      // the cap's frame time (1000 / CapFps)
+		double HeadroomMs = 0.0;    // BudgetMs - the bottleneck's median: how much work could still fit
+	};
+
+	static constexpr double CAP_MIN_WAIT_MS = 2.0;      // a capped frame waits at least this long...
+	static constexpr double CAP_MIN_WAIT_SHARE = 0.15;  // ...and this share of the frame
+	static constexpr double CAP_MAX_IQR_MS = 0.5;       // and frames cluster this tightly (or 5% of the frame)
+
+	inline FFrameCap DetectFrameCap(const TArray<double>& FrameMs, double BottleneckMedianMs)
+	{
+		FFrameCap C;
+		if (FrameMs.Num() < 30 || BottleneckMedianMs <= 0.0) return C;
+		C.FrameMedianMs = Percentile(FrameMs, 0.5);
+		if (C.FrameMedianMs <= 0.0) return C;
+		const double Iqr = Percentile(FrameMs, 0.75) - Percentile(FrameMs, 0.25);
+		const double Wait = C.FrameMedianMs - BottleneckMedianMs;
+		C.bCapped = Wait >= FMath::Max(CAP_MIN_WAIT_MS, CAP_MIN_WAIT_SHARE * C.FrameMedianMs)
+		         && Iqr <= FMath::Max(CAP_MAX_IQR_MS, 0.05 * C.FrameMedianMs);
+		if (C.bCapped)
+		{
+			C.CapFps = FMath::Max(1, FMath::RoundToInt32(1000.0 / C.FrameMedianMs));
+			C.BudgetMs = 1000.0 / C.CapFps;
+			C.HeadroomMs = C.BudgetMs - BottleneckMedianMs;
+		}
+		return C;
+	}
+
+	// What counts as a spike frame. Uncapped: 3x the median frame, and at least a dropped 30 fps frame.
+	// Capped: the median frame is the cap, so 3x it hides a stall that drops one frame (a 33 ms GC hitch in a
+	// 60 fps-capped run). Then use 3x the bottleneck thread's median (the real work), but at least one
+	// dropped frame at the cap (just under 2x the cap's budget, for timing jitter).
+	static constexpr double SPIKE_FACTOR = 3.0;
+	static constexpr double SPIKE_FLOOR_MS = 33.3;
+	static constexpr double CAP_DROPPED_FRAME_FACTOR = 1.9;
+
+	inline double SpikeThresholdMs(double FrameMedianMs, const FFrameCap& Cap, double BottleneckMedianMs)
+	{
+		if (Cap.bCapped) return FMath::Max(SPIKE_FACTOR * BottleneckMedianMs, CAP_DROPPED_FRAME_FACTOR * Cap.BudgetMs);
+		return FMath::Max(SPIKE_FACTOR * FrameMedianMs, SPIKE_FLOOR_MS);
 	}
 
 	// If the median winner is the slowest thread in fewer than this share of frames, the bottleneck

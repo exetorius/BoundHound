@@ -23,6 +23,10 @@ from Python with no C++ required. Run everything here from the editor's Python c
 > Stopping PIE only *requests* the end; the teardown happens on the next engine tick. So stop the
 > session, end your Python call / MCP request so the engine can tick, and start the next session in a
 > new call. (Before v1.0.1, starting a standalone in the same call as a PIE stop crashed the editor.)
+| `mem_stats()` | Memory / VRAM reading + pressure verdict. See [Memory and VRAM](#-memory-and-vram). |
+| `save_baseline(name="default", scenario="", source="capture", file="")` | Save a run as a named baseline in `Saved/BoundHound/baselines/<name>.json`. See [Baseline + diff](#-baseline--diff). |
+| `compare_baseline(name="default", source="capture", file="", force=False)` | Compare a run against a saved baseline: factual deltas, what changed beyond noise, verdict change. |
+| `list_baselines()` | The saved baselines (name, kind, scenario, created, verdict, map). |
 | `report(title, source="both", file="")` | Render a **self-contained HTML report** from the live verdict/budget + the most recent capture (frame stats, worst frames, PSO hitches) with a data-driven "fix in this order" list, to `Saved/BoundHound/report_<ts>.html`. See [The HTML report](#-the-html-report-report). |
 
 All methods return a JSON string. For a representative reading, profile under PIE or a standalone
@@ -231,10 +235,38 @@ least 33 ms) are merged into events and checked for a fixed beat. A burst of unr
 hide it:
 
 ```jsonc
-"spikes": { "spike_threshold_ms": 34.04, "spike_events": 8, "periodic": true, "interval_s": 61.1,
+"spikes": { "spike_threshold_ms": 34.04, "spike_threshold_basis": "3x the median frame, at least 33.3 ms",
+            "spike_events": 8, "periodic": true, "interval_s": 61.1,
             "matching_spikes": 3, "likely": "garbage collection: matches gc.TimeBetweenPurgingPendingKillObjects (default 61.1 s)",
-            "spike_times_s": [52.4, 70.6, 71.7, 72.7, 73.7, 78, 139.1, 200.2] }
+            "spike_times_s": [52.4, 70.6, 71.7, 72.7, 73.7, 78, 139.1, 200.2],
+            "spike_frames": [ /* the worst frame of each spike event, explained like worst_frames */ ] }
 ```
+
+`spikes.spike_frames` explains one frame per spike event (up to 10, in time order). The worst-frames
+list is usually all load frames, so a mid-run hitch, such as a GC every 61 s, is explained here instead.
+
+### Frame-capped runs (v1.2.0)
+
+With `t.MaxFPS`, VSync or a frame-rate limit setting, every frame waits for the cap, so `avg_fps` and
+`p95_frame_ms` measure the cap, not the game. `analyse()` detects this from the CSV: the frames sit
+tightly on one value well above the slowest thread's median. (The CSV's `targetframerate` metadata can't
+tell: the engine fills it from the display's refresh rate, so uncapped runs report it too.)
+
+```jsonc
+"frame_cap": { "capped": true, "cap_fps": 60, "cap_budget_ms": 16.67, "frame_median_ms": 16.67,
+               "bottleneck": "GPU", "bottleneck_median_ms": 9.75, "headroom_ms": 6.92,
+               "note": "Frame-rate capped at 60 fps ... Uncap (t.MaxFPS 0, r.VSync 0) to measure the game's own frame rate." }
+```
+
+- In a capped run the spike threshold is 3× the **bottleneck's** median, but at least one dropped frame
+  at the cap (1.9× the cap's budget). Otherwise a 33 ms GC hitch in a 60-capped run never counts: 3× a
+  16.7 ms median is 50 ms.
+- `csv_events` lists the CSV's own `EVENTS` column (`GC`, `FlushAsyncLoading`, ...) with counts and
+  times. Each explained frame gets the events recorded at that frame (`csv_events`) and they count as
+  evidence for `causes`, so GC is named even when the trace has no `CollectGarbage` scope.
+  `csv_alignment` says how the CSV's rows were matched to the trace's frames (by their frame times).
+- `report()` says the run was capped and shows the bottleneck's median and the headroom in place of the
+  steady-state p95.
 
 On the log side, `notable_lines` start once frames are running (config, plugin, font and other
 startup lines are skipped; `startup_lines_skipped` counts them), and `run_display` gives the resolution
@@ -253,6 +285,80 @@ which never sends the stat names to Unreal Insights, so in a `.utrace` they're o
 > **90 s+** before stopping if you want steady-state numbers. A shorter capture is still fine for
 > *demonstrating* the startup hitch (it's exactly what a warm PIE run hides), just not for hot-path
 > averages.
+
+## 🧠 Memory and VRAM
+
+The bound verdict covers compute. A frame can also stutter for memory reasons: VRAM over budget (the
+driver demotes resources to system memory and the GPU reads them over PCIe), a texture streaming pool too
+small for the view, or a machine that's paging. `mem_stats()` reads all three:
+
+```jsonc
+{
+  "system": { "total_physical_mb": 32690, "available_physical_mb": 9289, "process_used_mb": 6273, "process_peak_mb": 9039 },
+  "vram": { "available": true, "budget_mb": 11228, "used_mb": 1672, "used_pct": 14.9, "demoted_mb": 0,
+            "dedicated_video_mb": 11996, "streaming_textures_mb": 181, "non_streaming_textures_mb": 803 },
+  "texture_streaming": { "available": true, "pool_mb": 1000, "required_mb": 9, "over_budget_mb": 0 },
+  "pressure": "none",            // "warn" | "critical"
+  "issues": [],                  // each { issue, severity, why, lever }
+  "hint": "No memory pressure: ..."
+}
+```
+
+- **Issues:** `vram_over_budget` (anything demoted: critical), `vram_near_budget` (90%+ of the budget),
+  `streaming_over_budget` (the pool can't hold the wanted mips: blurry textures, mip churn),
+  `system_memory_low` (under 10% / 1 GB free; under 5% / 512 MB is critical).
+- The VRAM budget is the OS/driver's (DXGI on D3D12). RHIs that don't report one give
+  `vram.available: false`, and VRAM isn't judged.
+- `frame_timing()` includes a one-line `memory` object (`pressure`, process and VRAM MB, `issues`), so
+  obvious pressure shows up on the first call.
+- **It reads the editor process.** PIE runs inside the editor, so the process and VRAM numbers include
+  it. For the game alone, capture a standalone run: `analyse()` adds `memory_over_run` from the run's
+  CSV: the game process's peak and median, `growth_mb` from early in the run (25-35% in, past the
+  load) to the end, `notable_growth` (200 MB+ and 5%+), and the lowest free system RAM. `report()`
+  shows it and lists growth as a fix.
+
+## 📏 Baseline + diff
+
+The optimisation loop: capture, change something, capture again, and see what moved.
+
+```python
+# 1. Capture the scenario and save it as the baseline
+start_standalone("arena", "", 1920, 1080)   # ...play the scenario...
+stop_standalone()
+save_baseline("arena_before", "Arena wave 3, 2 min from spawn")   # source="capture", the last trace
+
+# 2. Make the change, capture the same scenario again, compare
+start_standalone("arena", "", 1920, 1080)   # ...same scenario...
+stop_standalone()
+compare_baseline("arena_before")
+```
+
+```jsonc
+{
+  "comparable": true,
+  "summary": [ "GPU median 9.75 -> 11.02 ms (+1.27 ms, +13.0%)", "PSO hitches 6 -> 8 (+2)" ],
+  "deltas": [ { "metric": "gpu_median_ms", "baseline": 9.75, "current": 11.02, "delta": 1.27, "delta_pct": 13.0, "changed": true }, ... ],
+  "bound_baseline": "GPU", "bound_current": "GPU", "bound_changed": false,
+  "mismatches": [], "warnings": [],
+  "scenario_note": "Scenario 'Arena wave 3, 2 min from spawn' is the label given when the baseline was saved. BoundHound doesn't verify the current run did the same work."
+}
+```
+
+- **What a baseline holds.** A capture baseline: average / p95 / worst frame, each thread's median and
+  p95 (from the run's CSV), spike events, PSO hitches and log errors, plus the run's verdict. And what it
+  ran on, read from the run's own log: engine version, platform, build config, project, RHI, GPU, CPU,
+  device profile, resolution, map, and frame cap. A `live` baseline is one `frame_timing` frame (noisy;
+  for quick checks only).
+- **Factual deltas only.** BoundHound reports what moved, never why. `changed` means beyond run-to-run
+  noise: at least 0.1 ms and 3% for a capture (10% for a live frame), any change for counts.
+- **Refuses mismatched setups.** A different engine version, platform, build config, project or kind
+  (capture vs live) means the numbers measure different things: `BASELINE_MISMATCH`, with the
+  `mismatches` listed. Pass `force=True` to compare anyway (with a warning). A different GPU, resolution,
+  map, frame cap or scenario label still compares, with a warning each.
+- **The scenario is your claim.** BoundHound can't know two runs did the same work; a baseline names
+  the scenario you gave it, and the comparison repeats that as your claim. Two runs of different work
+  give meaningless deltas, so fix the resolution (`res_x` / `res_y`) and play the same route.
+- With a frame cap, the average / p95 frame measure the cap: compare the thread medians.
 
 ## 📄 The HTML report (`report`)
 

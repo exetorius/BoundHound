@@ -159,4 +159,46 @@ public:
 	/** Stop the in-process Play-In-Editor session started with StartPIE. Tears down on the next tick. */
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "BoundHound|Performance")
 	static FString StopPIE();
+
+	/**
+	 * Save a run as a named baseline (<Project>/Saved/BoundHound/baselines/<Name>.json): its numbers (frame
+	 * stats, per-thread medians / p95, spikes, PSO hitches) and what it ran on (engine, platform, config,
+	 * GPU, resolution, map, frame cap), so a later run can be compared against it with CompareBaseline.
+	 * @param Name     Baseline name (letters, digits, - _ .). Saving again overwrites it.
+	 * @param Scenario Your label for the workload ("arena wave 3, 2 min"). BoundHound can't verify two runs
+	 *                 did the same work, so it reports this label as your claim and warns when they differ.
+	 * @param Source   "capture" (default): a standalone run's analysis (File, or the last trace).
+	 *                 "live": the current FrameTiming frame (one frame, noisy).
+	 * @param File     For "capture": the trace or log to use; empty = the last trace.
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "BoundHound|Performance")
+	static FString SaveBaseline(const FString& Name = TEXT("default"), const FString& Scenario = TEXT(""),
+	                            const FString& Source = TEXT("capture"), const FString& File = TEXT(""));
+
+	/**
+	 * Compare a run against a saved baseline: per metric baseline / current / delta / delta %, which ones
+	 * changed beyond noise, and whether the bound verdict changed. Factual deltas only, no causes. Refuses
+	 * (BASELINE_MISMATCH) when the engine version, platform, build config, project or kind differ, unless
+	 * Force; warns when the GPU, resolution, map, frame cap or scenario label differ.
+	 * @param Name   Baseline to compare against.
+	 * @param Source "capture" (default) or "live", as in SaveBaseline. Must match the baseline's kind.
+	 * @param File   For "capture": the trace or log of the run to compare; empty = the last trace.
+	 * @param bForce Compare even across a hard mismatch (the deltas then compare different setups).
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "BoundHound|Performance")
+	static FString CompareBaseline(const FString& Name = TEXT("default"), const FString& Source = TEXT("capture"),
+	                               const FString& File = TEXT(""), bool bForce = false);
+
+	/**
+	 * Memory / VRAM reading to go with the compute verdict: system RAM and this process, VRAM used vs the
+	 * OS/driver budget (and anything demoted to system memory), the texture streaming pool, and a pressure
+	 * verdict ("none" / "warn" / "critical") with an issue + lever for each problem found. Reads the editor
+	 * process (PIE included); for the game alone use a standalone capture (analyse() memory_over_run).
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "BoundHound|Performance")
+	static FString MemStats();
+
+	/** List the saved baselines: name, kind, scenario, created, verdict. */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "BoundHound|Performance")
+	static FString ListBaselines();
 };

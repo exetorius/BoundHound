@@ -6,6 +6,8 @@
 
 #include "BoundHoundVerdict.h"
 #include "BoundHoundDrilldown.h"
+#include "BoundHoundBaseline.h"
+#include "BoundHoundMemory.h"
 #include "BoundHoundService.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -237,7 +239,7 @@ bool FBoundHoundFrameTimingShapeTest::RunTest(const FString&)
 	for (const TCHAR* Field : { TEXT("game_thread_ms"), TEXT("render_thread_ms"), TEXT("rhi_thread_ms"),
 		TEXT("gpu_ms"), TEXT("frame_ms"), TEXT("fps"), TEXT("bound"), TEXT("bound_confidence"),
 		TEXT("margin_ms"), TEXT("contested"), TEXT("hint"), TEXT("pie_running"),
-		TEXT("frame_number"), TEXT("timestamp"), TEXT("repeat_read"), TEXT("warming") })
+		TEXT("frame_number"), TEXT("timestamp"), TEXT("repeat_read"), TEXT("warming"), TEXT("memory") })
 	{
 		TestTrue(FString::Printf(TEXT("has field %s"), Field), Obj->HasField(Field));
 	}
@@ -762,6 +764,338 @@ bool FBoundHoundDisplayArgsTest::RunTest(const FString&)
 		TEXT("LogInit: Command Line: /Game/Maps/L -game -ResX=2560 -ResY=1440 -windowed -WinX=980 -ResX=1920 -ResY=1080"), X, Y, Mode));
 	TestTrue (TEXT("first ResX/ResY wins, like the engine"), X == 2560 && Y == 1440);
 	TestEqual(TEXT("windowed"), Mode, FString(TEXT("windowed")));
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Frame-capped runs (issue #31)
+// ---------------------------------------------------------------------------
+
+// The CSV's FrameTime and EVENTS columns: "Name##seconds" entries, several per cell separated by ';'.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundCsvEventsTest,
+	"BoundHound.FrameCap.CsvEvents", kBHTestFlags)
+bool FBoundHoundCsvEventsTest::RunTest(const FString&)
+{
+	using namespace BoundHoundVerdict;
+	const FString Csv =
+		TEXT("EVENTS,FrameTime,RenderThreadTime,GameThreadTime,GPUTime\n")
+		TEXT(",16.67,7.8,4.5,9.7\n")
+		TEXT("GC##58.621448,16.67,7.8,33.4,9.7\n")
+		TEXT("FlushAsyncLoading##58.643;Foo##58.65,33.37,7.8,7.3,9.7\n")
+		TEXT(",16.67,7.8,4.5,9.7\n");
+	TArray<FThreadSample> S; FCsvThreadColumns Cols; TArray<FCsvEvent> Ev;
+	TestTrue (TEXT("parses"), ParseCsvThreadSamples(Csv, S, Cols, &Ev));
+	TestTrue (TEXT("FrameTime column found"), Cols.bFrame);
+	TestEqual(TEXT("4 samples"), S.Num(), 4);
+	if (S.Num() == 4) TestEqual(TEXT("frame time read"), S[2].FrameMs, 33.37);
+	TestEqual(TEXT("3 events"), Ev.Num(), 3);
+	if (Ev.Num() == 3)
+	{
+		TestEqual(TEXT("GC name"), Ev[0].Name, FString(TEXT("GC")));
+		TestEqual(TEXT("GC on sample 1"), Ev[0].Sample, 1);
+		TestTrue (TEXT("GC time"), FMath::IsNearlyEqual(Ev[0].TimeS, 58.621448, 1e-6));
+		TestEqual(TEXT("two events in one cell"), Ev[2].Name, FString(TEXT("Foo")));
+		TestEqual(TEXT("second on sample 2"), Ev[2].Sample, 2);
+	}
+
+	// The frame-time spike lands a row after the GC event: looking one row either side finds it.
+	const TArray<FString> Near = BoundHoundDrilldown::CsvEventsNear(Ev, 2);
+	TestTrue(TEXT("GC found from the spike row"), Near.Contains(TEXT("GC")) && Near.Contains(TEXT("FlushAsyncLoading")));
+	TestEqual(TEXT("nothing near sample 0 -> only GC (radius 1)"), BoundHoundDrilldown::CsvEventsNear(Ev, 0).Num(), 1);
+
+	// A CSV event is evidence for the cause classifier, as the Explain path feeds it.
+	auto HasCause = [](const TArray<BoundHoundDrilldown::FCause>& C, const TCHAR* Tag) { for (const auto& X : C) if (X.Tag == Tag) return true; return false; };
+	TestTrue(TEXT("CSV GC event -> garbage_collection"), HasCause(BoundHoundDrilldown::ClassifyCauses({ TEXT("CSVEvent \"GC\"") }, {}), TEXT("garbage_collection")));
+	TestTrue(TEXT("CSV FlushAsyncLoading event -> sync_load"), HasCause(BoundHoundDrilldown::ClassifyCauses({ TEXT("CSVEvent \"FlushAsyncLoading\"") }, {}), TEXT("sync_load")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundFrameCapTest,
+	"BoundHound.FrameCap.Detect", kBHTestFlags)
+bool FBoundHoundFrameCapTest::RunTest(const FString&)
+{
+	using namespace BoundHoundVerdict;
+	// The field report: t.MaxFPS 60, frames pinned at 16.667 ms, GPU median 9.75 ms.
+	TArray<double> Capped;
+	for (int32 i = 0; i < 600; ++i) Capped.Add(16.6668 + ((i % 5) - 2) * 0.001);
+	Capped[300] = 33.37; Capped[500] = 33.83; // the two GC frames
+	const FFrameCap C = DetectFrameCap(Capped, 9.75);
+	TestTrue (TEXT("capped detected"), C.bCapped);
+	TestEqual(TEXT("cap 60 fps"), C.CapFps, 60);
+	TestTrue (TEXT("headroom ~6.9 ms"), FMath::IsNearlyEqual(C.HeadroomMs, 16.6667 - 9.75, 0.01));
+
+	// The spike threshold must catch a 33 ms frame in a 60-capped run (3x the capped median = 50 ms didn't).
+	const double Th = SpikeThresholdMs(C.FrameMedianMs, C, 9.75);
+	TestTrue(TEXT("capped threshold below a dropped frame"), Th < 33.3 && Th > 16.7 * 1.5);
+
+	// Uncapped (the Proteus runs): frame ~= the slowest thread, wide spread.
+	TArray<double> Free;
+	for (int32 i = 0; i < 600; ++i) Free.Add(11.3 + ((i * 7) % 11 - 5) * 0.35);
+	const FFrameCap U = DetectFrameCap(Free, 11.2);
+	TestFalse(TEXT("uncapped not flagged"), U.bCapped);
+	TestTrue (TEXT("uncapped threshold unchanged (33.3 floor)"), FMath::IsNearlyEqual(SpikeThresholdMs(10.0, U, 9.8), 33.3, 0.001));
+	TestTrue (TEXT("uncapped threshold 3x median"), FMath::IsNearlyEqual(SpikeThresholdMs(20.0, U, 19.0), 60.0, 0.001));
+
+	// Pinned at 16.67 because the bottleneck itself takes ~16 ms: that's the game, not a cap.
+	TestFalse(TEXT("bottleneck fills the frame -> not capped"), DetectFrameCap(Capped, 15.9).bCapped);
+
+	// Big gap but frames all over the place: not a cap.
+	TArray<double> Noisy;
+	for (int32 i = 0; i < 600; ++i) Noisy.Add(20.0 + (i % 9) * 2.0);
+	TestFalse(TEXT("wide spread -> not capped"), DetectFrameCap(Noisy, 9.0).bCapped);
+
+	TestFalse(TEXT("too few frames"), DetectFrameCap({ 16.67, 16.67 }, 9.0).bCapped);
+	TestFalse(TEXT("no bottleneck reading"), DetectFrameCap(Capped, 0.0).bCapped);
+
+	// A 30 fps cap: a dropped frame is ~66 ms.
+	TArray<double> Thirty; for (int32 i = 0; i < 100; ++i) Thirty.Add(33.333);
+	const FFrameCap C30 = DetectFrameCap(Thirty, 12.0);
+	TestEqual(TEXT("cap 30 fps"), C30.CapFps, 30);
+	TestTrue (TEXT("30-cap threshold ~1.9x budget"), FMath::IsNearlyEqual(SpikeThresholdMs(C30.FrameMedianMs, C30, 12.0), 63.33, 0.05));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundCsvAlignTest,
+	"BoundHound.FrameCap.AlignCsvToTrace", kBHTestFlags)
+bool FBoundHoundCsvAlignTest::RunTest(const FString&)
+{
+	using namespace BoundHoundDrilldown;
+	// The CSV starts a few frames after the trace; the opening load frames pin the offset even though the rest
+	// of the run is capped flat.
+	TArray<double> Csv = { 2480.8, 110.1, 89.2, 1304.9, 45.0, 30.2 };
+	for (int32 i = 0; i < 700; ++i) Csv.Add(16.667 + (i % 3) * 0.002);
+	TArray<double> Trace = { 37000.0, 900.0, 15.0, 40.0, 22.0 }; // 5 frames before the CSV starts
+	for (double V : Csv) Trace.Add(V + 0.01);                    // same frames, slightly different timing
+	double Err = 0.0;
+	TestEqual(TEXT("offset 5"), AlignCsvToTrace(Trace, Csv, &Err), 5);
+	TestTrue (TEXT("small error"), Err < 0.05);
+
+	// Unrelated sequences don't align.
+	TArray<double> Other;
+	for (int32 i = 0; i < 800; ++i) Other.Add(5.0 + (i % 13) * 3.0);
+	TestEqual(TEXT("no match -> INDEX_NONE"), AlignCsvToTrace(Other, Csv), (int32)INDEX_NONE);
+
+	TestEqual(TEXT("too short -> INDEX_NONE"), AlignCsvToTrace(Trace, { 1.0, 2.0 }), (int32)INDEX_NONE);
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Baseline + diff (issue #6)
+// ---------------------------------------------------------------------------
+
+static BoundHoundBaseline::FSnapshot MakeCaptureSnapshot()
+{
+	BoundHoundBaseline::FSnapshot S;
+	S.Kind = TEXT("capture"); S.Scenario = TEXT("Rendlesham, 3 min walk"); S.Bound = TEXT("GPU");
+	S.Identity = { { TEXT("engineversion"), TEXT("5.8.4-58902052+++UE5+Release-5.8") }, { TEXT("platform"), TEXT("Windows") },
+	               { TEXT("config"), TEXT("Development") }, { TEXT("project"), TEXT("Corvus") }, { TEXT("gpu"), TEXT("RTX 4070 Ti") },
+	               { TEXT("resolution"), TEXT("3434x1352") }, { TEXT("map"), TEXT("/Game/Maps/Rendlesham") }, { TEXT("frame_cap"), TEXT("uncapped") } };
+	S.Metrics = { { TEXT("frame_avg_ms"), 11.2 }, { TEXT("gpu_median_ms"), 9.75 }, { TEXT("game_median_ms"), 4.55 }, { TEXT("pso_hitches"), 6.0 } };
+	return S;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundBaselineCompareTest,
+	"BoundHound.Baseline.Compare", kBHTestFlags)
+bool FBoundHoundBaselineCompareTest::RunTest(const FString&)
+{
+	using namespace BoundHoundBaseline;
+	const FSnapshot Base = MakeCaptureSnapshot();
+
+	// Same run: nothing changed, no mismatches.
+	const FComparison Same = Compare(Base, Base, false);
+	TestTrue (TEXT("same: no mismatches"), Same.Mismatches.IsEmpty());
+	TestEqual(TEXT("same: 4 deltas"), Same.Deltas.Num(), 4);
+	TestFalse(TEXT("same: nothing changed"), Same.Deltas.ContainsByPredicate([](const FDelta& D) { return D.bChanged; }));
+
+	// GPU got 1.27 ms slower, game thread moved within noise, two more PSO hitches.
+	FSnapshot Cur = Base;
+	Cur.Metrics[TEXT("gpu_median_ms")] = 11.02;
+	Cur.Metrics[TEXT("game_median_ms")] = 4.6;
+	Cur.Metrics[TEXT("pso_hitches")] = 8.0;
+	const FComparison C = Compare(Base, Cur, false);
+	auto Find = [&](const TCHAR* K) { return C.Deltas.FindByPredicate([K](const FDelta& D) { return D.Key == K; }); };
+	const FDelta* Gpu = Find(TEXT("gpu_median_ms"));
+	TestTrue (TEXT("gpu delta present"), Gpu != nullptr);
+	if (Gpu)
+	{
+		TestTrue (TEXT("gpu +1.27 ms"), FMath::IsNearlyEqual(Gpu->Delta, 1.27, 0.001));
+		TestTrue (TEXT("gpu +13.0%"), FMath::IsNearlyEqual(Gpu->DeltaPct, 13.03, 0.01));
+		TestTrue (TEXT("gpu changed"), Gpu->bChanged);
+		TestEqual(TEXT("gpu statement"), Gpu->Statement, FString(TEXT("GPU median 9.75 -> 11.02 ms (+1.27 ms, +13.0%)")));
+	}
+	const FDelta* Game = Find(TEXT("game_median_ms"));
+	TestTrue(TEXT("game +0.05 ms is noise"), Game && !Game->bChanged);
+	const FDelta* Pso = Find(TEXT("pso_hitches"));
+	TestTrue(TEXT("pso count change counts"), Pso && Pso->bChanged && Pso->Statement == TEXT("PSO hitches 6 -> 8 (+2)"));
+
+	// Verdict change.
+	Cur.Bound = TEXT("GameThread");
+	TestTrue(TEXT("bound change flagged"), Compare(Base, Cur, false).bBoundChanged);
+
+	// Hard mismatch (another engine build): refused, no deltas, unless forced.
+	FSnapshot Other = Base;
+	Other.Identity[TEXT("engineversion")] = TEXT("5.8.5-59000000+++UE5+Release-5.8");
+	const FComparison Hard = Compare(Base, Other, false);
+	TestTrue (TEXT("engine mismatch is hard"), Hard.bHardMismatch);
+	TestEqual(TEXT("refused: no deltas"), Hard.Deltas.Num(), 0);
+	const FComparison Forced = Compare(Base, Other, true);
+	TestTrue (TEXT("forced: deltas"), Forced.Deltas.Num() > 0);
+	TestTrue (TEXT("forced: warned"), Forced.Warnings.ContainsByPredicate([](const FString& W) { return W.StartsWith(TEXT("Forced past")); }));
+
+	// Kind mismatch (a live frame vs a capture) is hard too.
+	FSnapshot Live = Base; Live.Kind = TEXT("live");
+	TestTrue(TEXT("kind mismatch is hard"), Compare(Base, Live, false).bHardMismatch);
+
+	// Soft mismatches compare, with warnings: resolution, frame cap, scenario.
+	FSnapshot Soft = Base;
+	Soft.Identity[TEXT("resolution")] = TEXT("1920x1080");
+	Soft.Identity[TEXT("frame_cap")] = TEXT("60");
+	Soft.Scenario = TEXT("Rendlesham, combat");
+	const FComparison S = Compare(Base, Soft, false);
+	TestFalse(TEXT("soft: not hard"), S.bHardMismatch);
+	TestEqual(TEXT("soft: 3 mismatches"), S.Mismatches.Num(), 3);
+	TestTrue (TEXT("soft: still compared"), S.Deltas.Num() == 4);
+	TestTrue (TEXT("soft: cap warning"), S.Warnings.ContainsByPredicate([](const FString& W) { return W.Contains(TEXT("frame cap")); }));
+	TestTrue (TEXT("soft: scenario warning"), S.Warnings.ContainsByPredicate([](const FString& W) { return W.Contains(TEXT("scenario")); }));
+
+	// A field missing on one side can't be checked, so it's not a mismatch.
+	FSnapshot NoGpu = Base; NoGpu.Identity.Remove(TEXT("gpu"));
+	TestTrue(TEXT("unknown field: no mismatch"), Compare(Base, NoGpu, false).Mismatches.IsEmpty());
+
+	// Live frames are noisy: a 5% move isn't a change there, but is in a capture.
+	FSnapshot LiveA; LiveA.Kind = TEXT("live"); LiveA.Metrics = { { TEXT("gpu_ms"), 10.0 } };
+	FSnapshot LiveB = LiveA; LiveB.Metrics[TEXT("gpu_ms")] = 10.5;
+	TestFalse(TEXT("live: 5% is noise"), Compare(LiveA, LiveB, false).Deltas[0].bChanged);
+	FSnapshot CapA; CapA.Kind = TEXT("capture"); CapA.Metrics = { { TEXT("gpu_median_ms"), 10.0 } };
+	FSnapshot CapB = CapA; CapB.Metrics[TEXT("gpu_median_ms")] = 10.5;
+	TestTrue (TEXT("capture: 5% is a change"), Compare(CapA, CapB, false).Deltas[0].bChanged);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundBaselineIdentityTest,
+	"BoundHound.Baseline.IdentityAndJson", kBHTestFlags)
+bool FBoundHoundBaselineIdentityTest::RunTest(const FString&)
+{
+	using namespace BoundHoundBaseline;
+	// Lines from the field report's log.
+	const TCHAR* Lines[] = {
+		TEXT("LogCsvProfiler: Display: Metadata set : platform=\"Windows\""),
+		TEXT("LogCsvProfiler: Display: Metadata set : config=\"Development\""),
+		TEXT("LogCsvProfiler: Display: Metadata set : engineversion=\"5.8.4-58902052+++UE5+Release-5.8\""),
+		TEXT("LogCsvProfiler: Display: Metadata set : commandline=\"\" \"../../../../../Repos Unreal/Invasion/Corvus.uproject\" /Game/Maps/FirstEncounter/Rendlesham -game -PIEVIACONSOLE\""),
+		TEXT("LogCsvProfiler: Display: Metadata set : systemresolution.resx=\"1280\""),
+		TEXT("[2026.11.18-13.18.19:093][  0]LogCsvProfiler: Display: Metadata set : systemresolution.resx=\"3434\""),
+		TEXT("[2026.11.18-13.18.19:093][  0]LogCsvProfiler: Display: Metadata set : systemresolution.resy=\"1352\""),
+		TEXT("[2026.11.18-13.18.20:600][  0]LogCsvProfiler: Display: Metadata set : gpu=\"NVIDIA GeForce RTX 4070 Ti\""),
+		TEXT("LogTemp: unrelated"),
+	};
+	TMap<FString, FString> Meta;
+	for (const TCHAR* L : Lines)
+	{
+		FString K, V;
+		if (ParseMetadataLine(L, K, V)) Meta.Add(K.ToLower(), V);
+	}
+	TestEqual(TEXT("8 metadata lines, 7 keys (resx set twice)"), Meta.Num(), 7);
+	const TMap<FString, FString> Id = IdentityFromMetadata(Meta);
+	TestEqual(TEXT("gpu"), Id.FindRef(TEXT("gpu")), FString(TEXT("NVIDIA GeForce RTX 4070 Ti")));
+	TestEqual(TEXT("last resolution wins"), Id.FindRef(TEXT("resolution")), FString(TEXT("3434x1352")));
+	TestEqual(TEXT("map from command line"), Id.FindRef(TEXT("map")), FString(TEXT("/Game/Maps/FirstEncounter/Rendlesham")));
+	TestEqual(TEXT("project from a path with spaces"), Id.FindRef(TEXT("project")), FString(TEXT("Corvus")));
+	TestEqual(TEXT("engine"), Id.FindRef(TEXT("engineversion")), FString(TEXT("5.8.4-58902052+++UE5+Release-5.8")));
+
+	TestEqual(TEXT("name sanitised"), SanitiseName(TEXT("../before fix:1")), FString(TEXT("_before_fix_1")));
+	TestEqual(TEXT("empty name -> default"), SanitiseName(TEXT("  ")), FString(TEXT("default")));
+
+	// JSON round trip keeps everything Compare reads.
+	const FSnapshot S = MakeCaptureSnapshot();
+	FSnapshot Back;
+	TestTrue (TEXT("round trip parses"), FromJson(ToJson(S), Back));
+	TestEqual(TEXT("round trip: kind"), Back.Kind, S.Kind);
+	TestEqual(TEXT("round trip: scenario"), Back.Scenario, S.Scenario);
+	TestEqual(TEXT("round trip: identity"), Back.Identity.Num(), S.Identity.Num());
+	TestEqual(TEXT("round trip: metrics"), Back.Metrics.Num(), S.Metrics.Num());
+	TestTrue (TEXT("round trip: compares equal"), Compare(S, Back, false).Mismatches.IsEmpty());
+	TestFalse(TEXT("not a baseline -> false"), FromJson(MakeShared<FJsonObject>(), Back));
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Memory / VRAM (issue #8)
+// ---------------------------------------------------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundMemoryPressureTest,
+	"BoundHound.Memory.Pressure", kBHTestFlags)
+bool FBoundHoundMemoryPressureTest::RunTest(const FString&)
+{
+	using namespace BoundHoundMemory;
+	auto Tags = [](const TArray<FPressure>& P) { TArray<FString> T; for (const FPressure& X : P) T.Add(X.Tag); return T; };
+
+	FMemReading Ok;
+	Ok.TotalPhysicalMB = 32768; Ok.AvailablePhysicalMB = 16000; Ok.ProcessUsedMB = 6000;
+	Ok.bVramValid = true; Ok.VramBudgetMB = 11000; Ok.VramUsedMB = 6000;
+	Ok.bStreamingValid = true; Ok.PoolMB = 1000; Ok.RequiredPoolMB = 800;
+	TestEqual(TEXT("healthy: no issues"), ClassifyMemory(Ok).Num(), 0);
+	TestEqual(TEXT("healthy: pressure none"), OverallPressure(ClassifyMemory(Ok)), FString(TEXT("none")));
+
+	FMemReading Demoted = Ok; Demoted.VramUsedMB = 11200; Demoted.VramDemotedMB = 350;
+	const TArray<FPressure> D = ClassifyMemory(Demoted);
+	TestTrue (TEXT("demoted -> vram_over_budget"), Tags(D).Contains(TEXT("vram_over_budget")));
+	TestFalse(TEXT("demoted isn't also reported as near budget"), Tags(D).Contains(TEXT("vram_near_budget")));
+	TestEqual(TEXT("demoted -> critical"), OverallPressure(D), FString(TEXT("critical")));
+
+	FMemReading Near = Ok; Near.VramUsedMB = 10200; // 93%
+	TestTrue (TEXT("93% -> vram_near_budget"), Tags(ClassifyMemory(Near)).Contains(TEXT("vram_near_budget")));
+	TestEqual(TEXT("near -> warn"), OverallPressure(ClassifyMemory(Near)), FString(TEXT("warn")));
+
+	FMemReading Pool = Ok; Pool.OverBudgetMB = 240; Pool.RequiredPoolMB = 1240;
+	TestTrue(TEXT("streaming over budget"), Tags(ClassifyMemory(Pool)).Contains(TEXT("streaming_over_budget")));
+
+	FMemReading Low = Ok; Low.AvailablePhysicalMB = 2500; // < 10% of 32 GB
+	const TArray<FPressure> L = ClassifyMemory(Low);
+	TestTrue (TEXT("low RAM flagged"), Tags(L).Contains(TEXT("system_memory_low")));
+	TestEqual(TEXT("low RAM -> warn"), OverallPressure(L), FString(TEXT("warn")));
+	FMemReading Paging = Ok; Paging.AvailablePhysicalMB = 900; // < 5% of 32 GB
+	TestEqual(TEXT("very low RAM -> critical"), OverallPressure(ClassifyMemory(Paging)), FString(TEXT("critical")));
+
+	FMemReading NoVram = Ok; NoVram.bVramValid = false; NoVram.VramDemotedMB = 999; // not reported -> not judged
+	TestEqual(TEXT("no VRAM reading -> no VRAM issue"), ClassifyMemory(NoVram).Num(), 0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBoundHoundMemorySeriesTest,
+	"BoundHound.Memory.OverRun", kBHTestFlags)
+bool FBoundHoundMemorySeriesTest::RunTest(const FString&)
+{
+	using namespace BoundHoundMemory;
+	// A load ramp, then flat: no growth flag (the load is excluded).
+	TArray<double> Flat;
+	for (int32 i = 0; i < 1000; ++i) Flat.Add(i < 100 ? 2000.0 + i * 40.0 : 6000.0 + (i % 7));
+	const FSeries F = SummariseSeries(Flat);
+	TestTrue (TEXT("flat: valid"), F.bValid);
+	TestTrue (TEXT("flat: peak"), FMath::IsNearlyEqual(F.Peak, 6006.0));
+	TestTrue (TEXT("flat: ~0 growth"), FMath::Abs(F.GrowthMB) < 10.0);
+	TestFalse(TEXT("flat: not notable"), IsNotableGrowth(F));
+
+	// Steady climb through gameplay: 6000 -> 7000 MB.
+	TArray<double> Leak;
+	for (int32 i = 0; i < 1000; ++i) Leak.Add(6000.0 + i);
+	const FSeries G = SummariseSeries(Leak);
+	TestTrue(TEXT("leak: growth ~650 MB"), G.GrowthMB > 600.0 && G.GrowthMB < 700.0);
+	TestTrue(TEXT("leak: notable"), IsNotableGrowth(G));
+
+	TestFalse(TEXT("too few samples"), SummariseSeries({ 1.0, 2.0 }).bValid);
+
+	// Columns read in one pass, same row rules as the thread parser.
+	const FString Csv =
+		TEXT("EVENTS,FrameTime,PhysicalUsedMB,MemoryFreeMB\n")
+		TEXT(",16.6,6000,20000\n")
+		TEXT(",16.6,6010,19990\n")
+		TEXT("[HasHeaderRowAtEnd],1\n")
+		TEXT(",16.6,6020");
+	const TMap<FString, TArray<double>> C = ParseCsvColumns(Csv, { TEXT("PhysicalUsedMB"), TEXT("MemoryFreeMB"), TEXT("Missing") });
+	TestEqual(TEXT("2 rows of used"), C.FindRef(TEXT("PhysicalUsedMB")).Num(), 2);
+	TestTrue (TEXT("free read"), C.Contains(TEXT("MemoryFreeMB")) && C[TEXT("MemoryFreeMB")][1] == 19990.0);
+	TestFalse(TEXT("missing column absent"), C.Contains(TEXT("Missing")));
 	return true;
 }
 
